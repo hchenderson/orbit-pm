@@ -14,6 +14,11 @@ export const seedData: WorkspaceData = {
   settings: {
     defaultView: "overview",
     reminderTiming: "1 day",
+    reminderHoursBefore: 24,
+    timezone: "America/New_York",
+    dailyDigestTime: "08:00",
+    reminderEmail: true,
+    reminderInApp: true,
     dailyDigest: true,
     assignmentEmails: true,
     mentionEmails: true,

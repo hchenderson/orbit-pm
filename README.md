@@ -2,7 +2,7 @@
 
 Orbit is a focused project-management app for small teams. This repository contains a polished, interactive local MVP plus a Firebase-first production path using Authentication, Firestore, optional Cloud Storage, and scheduled reminders.
 
-The app runs immediately in demo mode. Projects, tasks, invitations, comments, filters, view choices, and task edits are saved in the browser so you can evaluate the product before creating cloud resources.
+The app runs immediately in demo mode. Set `NEXT_PUBLIC_DEMO_MODE=false` to require Firebase sign-in and persist workspace data to Firestore with realtime updates.
 
 Firebase project `orbit-pm-79c3b` is configured for local authentication and Analytics. The Firebase web configuration is public client configuration; database credentials and server secrets remain intentionally unset.
 
@@ -16,9 +16,14 @@ Firebase project `orbit-pm-79c3b` is configured for local authentication and Ana
 - List, drag-and-drop Kanban, timeline/Gantt, editable spreadsheet, and calendar views
 - Assignee and priority filters plus a cross-project “My tasks” entry point
 - In-app notification center and due-date reminder indicators
-- Firebase-ready email/password and Google sign-in page
-- PostgreSQL/Prisma production schema covering workspaces, roles, projects, tasks, dependencies, comments, attachments, reminders, notifications, and activity history
-- Unit tests for task filtering, progress, and overdue logic
+- Firebase email/password and Google sign-in with authenticated workspace access
+- Realtime Firestore persistence for workspaces, members, projects, tasks, and notifications
+- Role-based Firestore Security Rules, indexes, Emulator Suite configuration, and rules tests
+- Optional App Check integration using reCAPTCHA Enterprise
+- Invite-only email flow with hashed tokens, acceptance page, and Firebase Trigger Email queue
+- Per-user reminder timing, timezone, digest time, and email/in-app channel preferences
+- Boilerplate Privacy, Terms, Support, and Account Deletion pages
+- Unit tests for task filtering, progress, overdue logic, CSV import, and database permissions
 - Firebase App Hosting configuration
 
 ## Run locally
@@ -67,7 +72,7 @@ This runs a pinned Firebase CLI with `npx` and avoids writing to `/usr/local/lib
 | Web application | Next.js App Router + TypeScript | UI, server rendering, route handlers, validation |
 | Styling | Tailwind CSS plus application design tokens | Responsive, accessible interface |
 | Authentication | Firebase Authentication | Email/password and Google identity |
-| API authorization | Firebase Admin SDK | Verify Firebase ID tokens on every server mutation |
+| Data authorization | Firestore Security Rules | Enforce workspace membership and Owner/Admin/Member/Viewer permissions |
 | Structured data | Cloud Firestore | Projects, tasks, memberships, comments, reminders, templates, and searchable file metadata |
 | Attachments | Cloud Storage for Firebase, when needed | Uploaded documents, images, videos, and retained source files |
 | Reminders | Cloud Scheduler + Cloud Run/Functions | Find pending reminders, send email, and create notifications |
@@ -76,23 +81,18 @@ This runs a pinned Firebase CLI with `npx` and avoids writing to `/usr/local/lib
 
 Firestore and Cloud Storage are complementary, not substitutes. Use Firestore for small structured records and Storage for file bytes. CSV import can remain Firestore-only because the browser turns each row into a task; enable Storage when users can attach files or when the original import must be retained. Enforce Owner/Admin/Member/Viewer access in Firestore Security Rules and test those rules with the Emulator Suite before production.
 
-## Data model
-
-The complete relational schema is in `prisma/schema.prisma`.
+## Firestore data model
 
 ```text
-User ──< WorkspaceMember >── Workspace ──< Project ──< Task
-  │                                │          │          ├──< TaskAssignee >── User
-  │                                │          │          ├──< TaskDependency >── Task
-  │                                │          │          ├──< Comment
-  │                                │          │          ├──< Attachment
-  │                                │          │          └──< Reminder
-  │                                │          ├──< ProjectMember >── User
-  │                                │          └──< ActivityLog
-  │                                ├──< Invitation
-  │                                ├──< Label ──< TaskLabel >── Task
-  │                                └──< Notification
-  └──< ActivityLog
+users/{uid}
+└── defaultWorkspaceId
+
+workspaces/{workspaceId}
+├── members/{uid}
+├── projects/{projectId}
+├── tasks/{taskId}
+├── notifications/{notificationId}
+└── invitations/{invitationId}   (reserved for the email invitation backend)
 ```
 
 Important authorization rules:
@@ -101,7 +101,7 @@ Important authorization rules:
 - Admins manage members, projects, and workspace settings except ownership.
 - Members create and update work only in projects they can access.
 - Viewers can read permitted projects but cannot mutate data.
-- Every project query must first be scoped by `workspaceId` and the caller’s membership.
+- Every project query is scoped under its workspace and checked against the caller’s membership by `firestore.rules`.
 - Attachment upload paths should include workspace, project, task, and a generated object ID. Uploads should use short-lived server-issued URLs.
 - Invitation tokens must be random, expire, and be stored only as hashes.
 
@@ -120,6 +120,11 @@ Important authorization rules:
 ```text
 /                       Project workspace and dashboard
 /sign-in                Google/email sign-in and local demo entry
+/invite                 Secure invitation acceptance
+/privacy                Privacy Policy template
+/terms                  Terms of Service template
+/support                Support and security contact template
+/delete-account         Account deletion instructions template
 
 Workspace shell
 ├── Home                Project health, deadlines, workload, activity
@@ -142,12 +147,12 @@ Workspace shell
 2. In Firebase Authentication, enable Email/Password and Google providers.
 3. The supplied `.env.local` already contains the Orbit-PM public web configuration. Keep it out of Git; `.gitignore` already excludes it.
 4. Set `NEXT_PUBLIC_DEMO_MODE=false`.
-5. Initialize Firebase Admin with Google Application Default Credentials in App Hosting. Do not create or upload a service-account private key for production.
-6. Replace demo-mode navigation with a session provider that sends the signed-in user’s ID token to protected route handlers.
+5. Create Firestore and deploy the supplied rules and indexes.
+6. Register App Check with reCAPTCHA Enterprise and set `NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY` before enabling enforcement.
 
 The sign-in page already uses Firebase Authentication when the public configuration is present.
 
-## Enable PostgreSQL
+## Optional Prisma reference
 
 The Prisma schema remains in this repository as an optional relational-backend reference. It is not required for the recommended Firestore-first path.
 
@@ -165,7 +170,7 @@ npm run db:generate
 npm run db:migrate
 ```
 
-Before production, move the client-side workspace repository behind authenticated Next.js route handlers and Prisma transactions. Keep the existing UI state API—the view layer is intentionally separated from the production data choice.
+The active application uses Firestore. The Prisma schema is retained only as a reference if the project later moves to a relational backend.
 
 ## Reminder worker
 
@@ -179,15 +184,19 @@ Run a scheduled job every 15 minutes:
 
 Run the daily digest separately in each user’s time zone. Do not rely on a browser tab being open.
 
+## Email invitations
+
+The application uses invite-only membership and queues a named `workspace-invitation` email template for the Firebase Trigger Email extension. Follow [EMAIL_AND_INVITATIONS.md](./EMAIL_AND_INVITATIONS.md) to connect Resend SMTP, verify the sending domain, and create the Firestore template. Invitations remain valid until accepted or revoked; Firestore stores only a SHA-256 token hash.
+
 ## Implementation phases
 
 ### Phase 1 — Local MVP (included)
 
 Interactive projects, tasks, roles, views, filters, reminders, exports, responsive UI, local persistence, tests, and production schema.
 
-### Phase 2 — Shared backend
+### Phase 2 — Shared backend (included)
 
-Firebase session provider, verified API routes, Prisma repositories, workspace/project authorization, invitation acceptance, and database seed scripts.
+Firebase auth-state protection, realtime Firestore repositories, first-user provisioning, workspace/project authorization rules, indexes, and emulator tests.
 
 ### Phase 3 — Collaboration
 
@@ -205,8 +214,8 @@ End-to-end tests, rate limits, observability, backups, data export/deletion, acc
 
 1. Push this repository to GitHub.
 2. In Firebase Studio or the Firebase console, create an App Hosting backend and connect the repository.
-3. Add the public Firebase variables, server-only Admin variables, and PostgreSQL URLs in App Hosting settings.
-4. Run the Prisma migration against the production database before directing traffic to a build that expects the new schema.
+3. Add the public Firebase variables and App Check site key in App Hosting settings.
+4. Deploy `firestore.rules` and `firestore.indexes.json`.
 5. Deploy from the selected branch. `apphosting.yaml` contains conservative starter runtime limits that can be adjusted as usage grows.
 
 ## Publish this project to GitHub
@@ -236,6 +245,6 @@ gh repo create --source=. --private --remote=origin --push
 
 Before the first push, confirm `.env.local`, `node_modules`, `.next`, and `.firebase` appear as ignored. Firebase web client configuration is designed to be present in client code, but service-account keys, database credentials, email-provider keys, and other server secrets must never be committed.
 
-## Current MVP boundary
+## Current boundary
 
-Demo data is still stored in browser local storage so the app works immediately without cloud credentials. Firebase Authentication and Analytics are configured, but project and task writes are not yet connected to Firestore. It is suitable for product evaluation, UI iteration, and local development—not multi-user production. Real invitations, shared data, Firestore rules, email delivery, and optional file storage require Phase 2 and Phase 3 backend wiring described above.
+Demo mode stores data in browser local storage. Production mode requires Firebase Authentication and stores shared workspace data in Firestore. Secure invitation emails, scheduled reminder delivery, account deletion, and optional file attachments still require the external-service decisions listed in [PRODUCTION_CHECKLIST.md](./PRODUCTION_CHECKLIST.md).

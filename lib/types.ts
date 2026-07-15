@@ -6,11 +6,28 @@ export type ViewMode = "overview" | "list" | "board" | "timeline" | "table" | "c
 export interface WorkspaceSettings {
   defaultView: ViewMode;
   reminderTiming: "1 hour" | "1 day" | "2 days";
+  reminderHoursBefore: number;
+  timezone: string;
+  dailyDigestTime: string;
+  reminderEmail: boolean;
+  reminderInApp: boolean;
   dailyDigest: boolean;
   assignmentEmails: boolean;
   mentionEmails: boolean;
   overdueEmails: boolean;
   weekStartsOn: "Sunday" | "Monday";
+}
+
+export interface UserNotificationPreferences {
+  reminderHoursBefore: number;
+  timezone: string;
+  dailyDigestTime: string;
+  reminderEmail: boolean;
+  reminderInApp: boolean;
+  dailyDigest: boolean;
+  assignmentEmails: boolean;
+  mentionEmails: boolean;
+  overdueEmails: boolean;
 }
 
 export interface Member {
@@ -20,6 +37,7 @@ export interface Member {
   initials: string;
   color: string;
   role: Role;
+  preferences?: UserNotificationPreferences;
 }
 
 export interface Project {

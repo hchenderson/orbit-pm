@@ -45,12 +45,14 @@ import {
   Users,
   X,
 } from "lucide-react";
-import { FormEvent, useEffect, useMemo, useState } from "react";
+import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { seedData } from "@/lib/seed";
-import { enableFirebaseAnalytics, getFirebaseAuth, isFirebaseConfigured } from "@/lib/firebase";
+import { enableFirebaseAnalytics, enableFirebaseAppCheck, getFirebaseAuth, getFirebaseFirestore, isDemoMode, isFirebaseConfigured } from "@/lib/firebase";
 import { parseTaskCsv, type ImportedTask } from "@/lib/csv-import";
 import { csvColumns, projectTemplates, sampleCsv, type ProjectTemplate } from "@/lib/project-templates";
-import { signOut } from "firebase/auth";
+import { onAuthStateChanged, signOut } from "firebase/auth";
+import { ensureUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
+import { createWorkspaceInvitation } from "@/lib/invitations";
 import { dateLabel, daysUntil, filterTasks, isDueToday, isOverdue, PRIORITIES, taskProgress, TASK_STATUSES } from "@/lib/task-utils";
 import type { Member, Priority, Project, Role, Task, TaskStatus, ViewMode, WorkspaceData } from "@/lib/types";
 
@@ -124,27 +126,108 @@ export function ProjectApp() {
   const [myTasksOnly, setMyTasksOnly] = useState(false);
   const [section, setSection] = useState<AppSection>("project");
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
-
-  useEffect(() => {
-    try {
-      const saved = window.localStorage.getItem(STORAGE_KEY);
-      if (saved) {
-        const parsed = JSON.parse(saved) as WorkspaceData;
-        setData({ ...parsed, settings: { ...seedData.settings!, ...parsed.settings } });
-      }
-    } catch {
-      // A malformed local demo record should never prevent the workspace from loading.
-    }
-    setLoaded(true);
-  }, []);
+  const [dataMode, setDataMode] = useState<"loading" | "local" | "firestore">("loading");
+  const [cloudError, setCloudError] = useState("");
+  const [currentUserId, setCurrentUserId] = useState("m1");
+  const workspaceIdRef = useRef("");
+  const lastCloudDataRef = useRef<WorkspaceData | null>(null);
+  const queuedCloudDataRef = useRef<WorkspaceData | null>(null);
+  const pendingSyncsRef = useRef(0);
+  const syncQueueRef = useRef(Promise.resolve());
 
   useEffect(() => {
     void enableFirebaseAnalytics();
+    void enableFirebaseAppCheck().catch((error: unknown) => {
+      setCloudError(`Firebase App Check could not start: ${error instanceof Error ? error.message : "Unknown error"}`);
+    });
+
+    if (!isFirebaseConfigured || isDemoMode) {
+      try {
+        const saved = window.localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          const parsed = JSON.parse(saved) as WorkspaceData;
+          setData({ ...parsed, settings: { ...seedData.settings!, ...parsed.settings } });
+        }
+      } catch {
+        // A malformed local demo record should never prevent the workspace from loading.
+      }
+      setDataMode("local");
+      setLoaded(true);
+      return;
+    }
+
+    const auth = getFirebaseAuth();
+    const db = getFirebaseFirestore();
+    if (!auth || !db) {
+      setCloudError("Firebase could not be initialized. Check the production environment variables.");
+      return;
+    }
+
+    let workspaceUnsubscribe: (() => void) | undefined;
+    let cancelled = false;
+    const authUnsubscribe = onAuthStateChanged(auth, (user) => {
+      workspaceUnsubscribe?.();
+      workspaceUnsubscribe = undefined;
+      if (!user) {
+        window.location.replace("/sign-in");
+        return;
+      }
+      setCurrentUserId(user.uid);
+      void ensureUserWorkspace(db, user).then((workspaceId) => {
+        if (cancelled) return;
+        workspaceIdRef.current = workspaceId;
+        workspaceUnsubscribe = subscribeToWorkspace(db, workspaceId, user.uid, (cloudData) => {
+          if (pendingSyncsRef.current > 0) {
+            queuedCloudDataRef.current = cloudData;
+            return;
+          }
+          lastCloudDataRef.current = cloudData;
+          setData(cloudData);
+          setDataMode("firestore");
+          setLoaded(true);
+          setCloudError("");
+        }, (error) => {
+          setCloudError(`Firestore could not load this workspace: ${error.message}`);
+        });
+      }).catch((error: unknown) => {
+        setCloudError(`Your workspace could not be created: ${error instanceof Error ? error.message : "Unknown error"}`);
+      });
+    });
+
+    return () => {
+      cancelled = true;
+      authUnsubscribe();
+      workspaceUnsubscribe?.();
+    };
   }, []);
 
   useEffect(() => {
-    if (loaded) window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-  }, [data, loaded]);
+    if (!loaded) return;
+    if (dataMode === "local") {
+      window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+      return;
+    }
+    const db = getFirebaseFirestore();
+    const previous = lastCloudDataRef.current;
+    const workspaceId = workspaceIdRef.current;
+    if (dataMode !== "firestore" || !db || !previous || !workspaceId || JSON.stringify(previous) === JSON.stringify(data)) return;
+    lastCloudDataRef.current = data;
+    pendingSyncsRef.current += 1;
+    syncQueueRef.current = syncQueueRef.current
+      .then(() => syncWorkspace(db, workspaceId, currentUserId, previous, data))
+      .catch((error: unknown) => {
+        setCloudError(`A change could not be saved: ${error instanceof Error ? error.message : "Unknown error"}`);
+      })
+      .finally(() => {
+        pendingSyncsRef.current -= 1;
+        if (pendingSyncsRef.current === 0 && queuedCloudDataRef.current) {
+          const cloudData = queuedCloudDataRef.current;
+          queuedCloudDataRef.current = null;
+          lastCloudDataRef.current = cloudData;
+          setData(cloudData);
+        }
+      });
+  }, [currentUserId, data, dataMode, loaded]);
 
   useEffect(() => {
     if (!toast) return;
@@ -155,9 +238,9 @@ export function ProjectApp() {
   const activeProject = data.projects.find((project) => project.id === activeProjectId) ?? data.projects[0];
   const projectTasks = data.tasks.filter((task) => task.projectId === activeProject?.id);
   const visibleTasks = useMemo(() => {
-    const base = myTasksOnly ? projectTasks.filter((task) => task.assigneeId === "m1") : projectTasks;
+    const base = myTasksOnly ? projectTasks.filter((task) => task.assigneeId === currentUserId) : projectTasks;
     return filterTasks(base, query, assigneeFilter, priorityFilter);
-  }, [projectTasks, query, assigneeFilter, priorityFilter, myTasksOnly]);
+  }, [projectTasks, query, assigneeFilter, priorityFilter, myTasksOnly, currentUserId]);
   const selectedTask = data.tasks.find((task) => task.id === selectedTaskId) ?? null;
   const unreadCount = data.notifications.filter((notification) => !notification.read).length;
 
@@ -173,6 +256,15 @@ export function ProjectApp() {
     const auth = getFirebaseAuth();
     if (auth?.currentUser) await signOut(auth);
     window.location.href = "/sign-in";
+  }
+
+  function saveProject(project: Project, tasks: Task[]) {
+    setData((current) => ({ ...current, projects: [...current.projects, project], tasks: [...current.tasks, ...tasks] }));
+    setActiveProjectId(project.id);
+    setView(data.settings?.defaultView ?? "overview");
+    setSection("project");
+    setProjectModalOpen(false);
+    setToast(`Project created with ${tasks.length} starter task${tasks.length === 1 ? "" : "s"}`);
   }
 
   function updateTask(taskId: string, patch: Partial<Task>) {
@@ -219,6 +311,28 @@ export function ProjectApp() {
     setToast("CSV exported");
   }
 
+  async function inviteTeammate(email: string, role: Role) {
+    if (dataMode === "firestore") {
+      const db = getFirebaseFirestore();
+      const inviter = data.members.find((member) => member.id === currentUserId);
+      if (!db || !inviter || !workspaceIdRef.current) throw new Error("The workspace connection is not ready.");
+      await createWorkspaceInvitation(db, workspaceIdRef.current, inviter, email, role);
+      setInviteModalOpen(false);
+      setToast(`Invitation queued for ${email}`);
+      return;
+    }
+    const id = uid("member");
+    const name = email.split("@")[0].split(/[._-]/).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" ");
+    const member: Member = { id, name, email, initials: name.split(" ").map((word) => word[0]).join("").slice(0, 2), color: "#4d799f", role };
+    setData((current) => ({ ...current, members: [...current.members, member], projects: current.projects.map((project) => project.id === activeProject.id ? { ...project, memberIds: [...project.memberIds, id] } : project) }));
+    setInviteModalOpen(false);
+    setToast(`Demo teammate added for ${email}`);
+  }
+
+  if (!loaded) return <main className="workspace-loading"><span className="brand-mark"><Sparkles size={19} /></span><strong>Opening your workspace…</strong><small>{cloudError || "Connecting securely to Orbit"}</small></main>;
+  if (cloudError && dataMode !== "local") return <main className="workspace-loading error"><CircleAlert size={24} /><strong>Orbit couldn’t open your workspace</strong><small>{cloudError}</small><button className="primary-button" onClick={() => window.location.reload()}>Try again</button></main>;
+  if (!activeProject) return <><main className="workspace-loading"><span className="brand-mark"><Sparkles size={19} /></span><strong>Welcome to Orbit</strong><small>Let’s set up your first project.</small></main><ProjectModal data={data} onboarding close={() => undefined} save={saveProject} /></>;
+
   return (
     <div className="app-shell">
       {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
@@ -234,7 +348,7 @@ export function ProjectApp() {
         </button>
         <nav className="main-nav" aria-label="Main navigation">
           <button className={section === "project" && !myTasksOnly && view === "overview" ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(false); setView("overview"); setSidebarOpen(false); }}><LayoutDashboard size={17} /> Home</button>
-          <button className={section === "project" && myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(true); setView("list"); setSidebarOpen(false); }}><CheckCircle2 size={17} /> My tasks <span className="nav-count">{data.tasks.filter((task) => task.assigneeId === "m1" && task.status !== "Complete").length}</span></button>
+          <button className={section === "project" && myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(true); setView("list"); setSidebarOpen(false); }}><CheckCircle2 size={17} /> My tasks <span className="nav-count">{data.tasks.filter((task) => task.assigneeId === currentUserId && task.status !== "Complete").length}</span></button>
           <button className={section === "inbox" ? "active" : ""} onClick={() => openSection("inbox")}><Inbox size={17} /> Inbox {unreadCount > 0 && <span className="nav-dot">{unreadCount}</span>}</button>
         </nav>
         <div className="sidebar-section-heading"><span>Projects</span><button aria-label="New project" onClick={() => setProjectModalOpen(true)}><Plus size={15} /></button></div>
@@ -308,16 +422,16 @@ export function ProjectApp() {
           {section === "project" && view === "calendar" && <CalendarView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} />}
           {section === "people" && <PeopleView data={data} invite={() => setInviteModalOpen(true)} updateRole={(memberId, role) => setData((current) => ({ ...current, members: current.members.map((member) => member.id === memberId ? { ...member, role } : member) }))} />}
           {section === "inbox" && <InboxView data={data} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} markOne={(id) => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => notification.id === id ? { ...notification, read: true } : notification) }))} openSettings={() => openSection("settings")} />}
-          {section === "settings" && <SettingsView data={data} update={(patch) => setData((current) => ({ ...current, ...patch }))} notify={setToast} />}
+          {section === "settings" && <SettingsView data={data} currentUserId={currentUserId} dataMode={dataMode} update={(patch) => setData((current) => ({ ...current, ...patch }))} notify={setToast} />}
         </section>
       </main>
 
       {notificationsOpen && <NotificationPanel data={data} close={() => setNotificationsOpen(false)} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openInbox={() => openSection("inbox")} openSettings={() => openSection("settings")} />}
-      {profileMenuOpen && <ProfileMenu member={data.members[0]} firebaseConnected={isFirebaseConfigured} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} signOut={() => void handleSignOut()} />}
+      {profileMenuOpen && <ProfileMenu member={data.members[0]} firebaseConnected={dataMode === "firestore"} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} signOut={() => void handleSignOut()} />}
       {selectedTask && <TaskDrawer data={data} task={selectedTask} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} />}
       {taskModalOpen && <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={(task) => { setData((current) => ({ ...current, tasks: [...current.tasks, task] })); setTaskModalOpen(false); setToast("Task created"); }} />}
-      {projectModalOpen && <ProjectModal data={data} close={() => setProjectModalOpen(false)} save={(project, tasks) => { setData((current) => ({ ...current, projects: [...current.projects, project], tasks: [...current.tasks, ...tasks] })); setActiveProjectId(project.id); setView(data.settings?.defaultView ?? "overview"); setSection("project"); setProjectModalOpen(false); setToast(`Project created with ${tasks.length} starter task${tasks.length === 1 ? "" : "s"}`); }} />}
-      {inviteModalOpen && <InviteModal close={() => setInviteModalOpen(false)} save={(email, role) => { const id = uid("member"); const name = email.split("@")[0].split(/[._-]/).map((word) => word.charAt(0).toUpperCase() + word.slice(1)).join(" "); const member: Member = { id, name, email, initials: name.split(" ").map((word) => word[0]).join("").slice(0, 2), color: "#4d799f", role }; setData((current) => ({ ...current, members: [...current.members, member], projects: current.projects.map((project) => project.id === activeProject.id ? { ...project, memberIds: [...project.memberIds, id] } : project) })); setInviteModalOpen(false); setToast(`Invite ready for ${email}`); }} />}
+      {projectModalOpen && <ProjectModal data={data} close={() => setProjectModalOpen(false)} save={saveProject} />}
+      {inviteModalOpen && <InviteModal dataMode={dataMode} close={() => setInviteModalOpen(false)} save={inviteTeammate} />}
       {toast && <div className="toast"><Check size={16} />{toast}</div>}
     </div>
   );
@@ -402,11 +516,21 @@ function Toggle({ checked, onChange, label, description }: { checked: boolean; o
   return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><i /></label>;
 }
 
-function SettingsView({ data, update, notify }: { data: WorkspaceData; update: (patch: Partial<WorkspaceData>) => void; notify: (message: string) => void }) {
-  const settings = data.settings ?? seedData.settings!;
+function SettingsView({ data, currentUserId, dataMode, update, notify }: { data: WorkspaceData; currentUserId: string; dataMode: "loading" | "local" | "firestore"; update: (patch: Partial<WorkspaceData>) => void; notify: (message: string) => void }) {
+  const settings = { ...seedData.settings!, ...data.settings };
+  const currentMember = data.members.find((member) => member.id === currentUserId) ?? data.members[0];
+  const preferences = { reminderHoursBefore: settings.reminderHoursBefore, timezone: settings.timezone, dailyDigestTime: settings.dailyDigestTime, reminderEmail: settings.reminderEmail, reminderInApp: settings.reminderInApp, dailyDigest: settings.dailyDigest, assignmentEmails: settings.assignmentEmails, mentionEmails: settings.mentionEmails, overdueEmails: settings.overdueEmails, ...currentMember.preferences };
   const [workspaceName, setWorkspaceName] = useState(data.workspaceName);
   function updateSettings(patch: Partial<typeof settings>) { update({ settings: { ...settings, ...patch } }); }
-  return <div className="management-page"><SectionHeader eyebrow="Workspace" title="Settings" description="Manage workspace details, defaults, and notifications." action={<span className={`connection-badge ${isFirebaseConfigured ? "connected" : ""}`}><i />{isFirebaseConfigured ? "Firebase configured" : "Demo mode"}</span>} /><div className="settings-layout"><nav className="settings-nav"><button className="active"><Settings size={15} /> General</button><button><Bell size={15} /> Notifications</button><button><ShieldCheck size={15} /> Permissions</button><button><Link2 size={15} /> Integrations</button></nav><div className="settings-content"><section className="settings-card"><header><h2>Workspace details</h2><p>The name and identity your team sees throughout Orbit.</p></header><div className="settings-fields"><label>Workspace name<input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} /></label><label>Workspace URL<div className="url-input"><span>orbit.app/</span><input value="northstar-studio" readOnly /></div></label><label>Week starts on<select value={settings.weekStartsOn} onChange={(event) => updateSettings({ weekStartsOn: event.target.value as "Sunday" | "Monday" })}><option>Monday</option><option>Sunday</option></select></label><label>Default project view<select value={settings.defaultView} onChange={(event) => updateSettings({ defaultView: event.target.value as ViewMode })}>{viewOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label></div><footer><button className="primary-button" onClick={() => { if (workspaceName.trim()) update({ workspaceName: workspaceName.trim() }); notify("Workspace settings saved"); }}>Save changes</button></footer></section><section className="settings-card"><header><h2>Reminders and email</h2><p>Decide how Orbit keeps you and your team informed.</p></header><div className="settings-fields single-column"><label>Default due-date reminder<select value={settings.reminderTiming} onChange={(event) => updateSettings({ reminderTiming: event.target.value as typeof settings.reminderTiming })}><option>1 hour</option><option>1 day</option><option>2 days</option></select></label><Toggle checked={settings.assignmentEmails} onChange={(checked) => updateSettings({ assignmentEmails: checked })} label="Task assignments" description="Email me when a task is assigned to me." /><Toggle checked={settings.mentionEmails} onChange={(checked) => updateSettings({ mentionEmails: checked })} label="Mentions and comments" description="Email me when someone mentions me." /><Toggle checked={settings.overdueEmails} onChange={(checked) => updateSettings({ overdueEmails: checked })} label="Overdue reminders" description="Send a daily reminder for overdue work." /><Toggle checked={settings.dailyDigest} onChange={(checked) => updateSettings({ dailyDigest: checked })} label="Daily digest" description="A morning summary of upcoming and overdue tasks." /></div></section><section className="settings-card firebase-card"><header><h2>Firebase project</h2><p>Client configuration used by this local application.</p></header><dl><div><dt>Project</dt><dd>Orbit-PM</dd></div><div><dt>Project ID</dt><dd>orbit-pm-79c3b</dd></div><div><dt>Authentication</dt><dd>{isFirebaseConfigured ? "SDK connected" : "Not configured"}</dd></div><div><dt>Data mode</dt><dd>Local MVP</dd></div></dl><p className="firebase-note"><CircleAlert size={15} /> Firebase Authentication is configured locally. Shared PostgreSQL data, server authorization, email delivery, and scheduled reminders still require backend implementation.</p></section></div></div></div>;
+  function updatePreferences(patch: Partial<typeof preferences>) { update({ members: data.members.map((member) => member.id === currentMember.id ? { ...member, preferences: { ...preferences, ...patch } } : member) }); }
+  return <div className="management-page">
+    <SectionHeader eyebrow="Workspace" title="Settings" description="Manage workspace details, defaults, and notifications." action={<span className={`connection-badge ${dataMode === "firestore" ? "connected" : ""}`}><i />{dataMode === "firestore" ? "Firestore connected" : "Local demo mode"}</span>} />
+    <div className="settings-layout"><nav className="settings-nav"><button className="active"><Settings size={15} /> General</button><button><Bell size={15} /> Notifications</button><button><ShieldCheck size={15} /> Permissions</button><button><Link2 size={15} /> Integrations</button></nav><div className="settings-content">
+      <section className="settings-card"><header><h2>Workspace details</h2><p>The name and identity your team sees throughout Orbit.</p></header><div className="settings-fields"><label>Workspace name<input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} /></label><label>Workspace URL<div className="url-input"><span>orbit.app/</span><input value="northstar-studio" readOnly /></div></label><label>Week starts on<select value={settings.weekStartsOn} onChange={(event) => updateSettings({ weekStartsOn: event.target.value as "Sunday" | "Monday" })}><option>Monday</option><option>Sunday</option></select></label><label>Default project view<select value={settings.defaultView} onChange={(event) => updateSettings({ defaultView: event.target.value as ViewMode })}>{viewOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label></div><footer><button className="primary-button" onClick={() => { if (workspaceName.trim()) update({ workspaceName: workspaceName.trim() }); notify("Workspace settings saved"); }}>Save changes</button></footer></section>
+      <section className="settings-card"><header><h2>My reminders and email</h2><p>Customize timing, timezone, digest delivery, and channels for your account.</p></header><div className="settings-fields"><label>Remind me before due date<input type="number" min="0" max="720" value={preferences.reminderHoursBefore} onChange={(event) => updatePreferences({ reminderHoursBefore: Math.max(0, Number(event.target.value)) })} /><small className="field-help">Hours before the task is due</small></label><label>Timezone<input value={preferences.timezone} onChange={(event) => updatePreferences({ timezone: event.target.value })} placeholder="America/New_York" /></label><label>Daily digest time<input type="time" value={preferences.dailyDigestTime} onChange={(event) => updatePreferences({ dailyDigestTime: event.target.value })} /></label></div><div className="settings-fields single-column reminder-toggles"><Toggle checked={preferences.reminderInApp} onChange={(checked) => updatePreferences({ reminderInApp: checked })} label="In-app reminders" description="Create notifications in Orbit." /><Toggle checked={preferences.reminderEmail} onChange={(checked) => updatePreferences({ reminderEmail: checked })} label="Email reminders" description="Send reminders through the configured email provider." /><Toggle checked={preferences.assignmentEmails} onChange={(checked) => updatePreferences({ assignmentEmails: checked })} label="Task assignments" description="Email me when a task is assigned to me." /><Toggle checked={preferences.mentionEmails} onChange={(checked) => updatePreferences({ mentionEmails: checked })} label="Mentions and comments" description="Email me when someone mentions me." /><Toggle checked={preferences.overdueEmails} onChange={(checked) => updatePreferences({ overdueEmails: checked })} label="Overdue reminders" description="Send a daily reminder for overdue work." /><Toggle checked={preferences.dailyDigest} onChange={(checked) => updatePreferences({ dailyDigest: checked })} label="Daily digest" description={`Deliver a summary at ${preferences.dailyDigestTime} in ${preferences.timezone}.`} /></div></section>
+      <section className="settings-card firebase-card"><header><h2>Firebase project</h2><p>Connection used by this application.</p></header><dl><div><dt>Project</dt><dd>Orbit-PM</dd></div><div><dt>Project ID</dt><dd>orbit-pm-79c3b</dd></div><div><dt>Authentication</dt><dd>{isFirebaseConfigured ? "SDK connected" : "Not configured"}</dd></div><div><dt>Data mode</dt><dd>{dataMode === "firestore" ? "Shared Firestore" : "Browser local storage"}</dd></div></dl><p className="firebase-note"><CircleAlert size={15} /> {dataMode === "firestore" ? "Projects, tasks, preferences, and invitations sync through Firestore. Scheduled reminder delivery requires the worker deployment." : "Demo mode keeps data in this browser. Set NEXT_PUBLIC_DEMO_MODE=false to require sign-in and use Firestore."}</p></section>
+    </div></div>
+  </div>;
 }
 
 function ProfileMenu({ member, firebaseConnected, close, openSettings, signOut }: { member: Member; firebaseConnected: boolean; close: () => void; openSettings: () => void; signOut: () => void }) {
@@ -457,8 +581,8 @@ function TaskDrawer({ data, task, close, update, remove }: { data: WorkspaceData
   return <><button className="drawer-backdrop" aria-label="Close task" onClick={close} /><aside className="task-drawer"><header><div><span className="breadcrumb">{data.projects.find((project) => project.id === task.projectId)?.name}</span><ChevronRight size={13} /><span>{task.id.slice(0, 8).toUpperCase()}</span></div><div><button className="icon-button"><Link2 size={16} /></button><button className="icon-button" onClick={() => remove(task.id)}><Trash2 size={16} /></button><button className="icon-button" onClick={close}><X size={18} /></button></div></header><div className="drawer-body"><div className="drawer-title"><button className={`task-check ${statusTone[task.status]}`} onClick={() => update(task.id, { status: task.status === "Complete" ? "Not Started" : "Complete" })}><StatusIcon status={task.status} /></button><textarea value={task.title} onChange={(event) => update(task.id, { title: event.target.value })} rows={2} /></div><textarea className="description-edit" value={task.description} onChange={(event) => update(task.id, { description: event.target.value })} rows={3} placeholder="Add a description…" /><div className="task-properties"><label><span>Status</span><select value={task.status} onChange={(event) => update(task.id, { status: event.target.value as TaskStatus })}>{TASK_STATUSES.map((status) => <option key={status}>{status}</option>)}</select></label><label><span>Assignee</span><select value={task.assigneeId} onChange={(event) => update(task.id, { assigneeId: event.target.value })}>{data.members.map((member) => <option value={member.id} key={member.id}>{member.name}</option>)}</select></label><label><span>Priority</span><select value={task.priority} onChange={(event) => update(task.id, { priority: event.target.value as Priority })}>{PRIORITIES.map((priority) => <option key={priority}>{priority}</option>)}</select></label><label><span>Start date</span><input type="date" value={task.startDate} onChange={(event) => update(task.id, { startDate: event.target.value })} /></label><label><span>Due date</span><input type="date" value={task.dueDate} onChange={(event) => update(task.id, { dueDate: event.target.value })} /></label><label><span>Estimate</span><input type="number" min="0" value={task.estimate} onChange={(event) => update(task.id, { estimate: Number(event.target.value) })} /></label></div><div className="drawer-section"><h3>Subtasks <span>{task.subtasks.filter((subtask) => subtask.complete).length}/{task.subtasks.length}</span></h3>{task.subtasks.length ? task.subtasks.map((subtask) => <button key={subtask.id} onClick={() => update(task.id, { subtasks: task.subtasks.map((item) => item.id === subtask.id ? { ...item, complete: !item.complete } : item) })}><span className={`mini-check ${subtask.complete ? "complete" : ""}`}>{subtask.complete && <Check size={11} />}</span><span className={subtask.complete ? "done" : ""}>{subtask.title}</span></button>) : <p className="drawer-empty">No subtasks yet.</p>}<button className="add-subtask" onClick={() => { const title = window.prompt("Subtask name"); if (title) update(task.id, { subtasks: [...task.subtasks, { id: uid("sub"), title, complete: false }] }); }}><Plus size={14} /> Add subtask</button></div><div className="drawer-section"><h3>Activity</h3><div className="activity-comment"><Avatar member={data.members[1]} small /><span><p><strong>Maya Chen</strong> updated the status to <b>{task.status}</b></p><small>Today at 10:24 AM</small></span></div><div className="comment-box"><Avatar member={data.members[0]} small /><div><textarea placeholder="Leave a comment or @mention someone…" value={comment} onChange={(event) => setComment(event.target.value)} /><button disabled={!comment.trim()} onClick={() => { update(task.id, { comments: task.comments + 1 }); setComment(""); }}>Comment</button></div></div></div></div></aside></>;
 }
 
-function ModalShell({ title, subtitle, close, children, className = "" }: { title: string; subtitle: string; close: () => void; children: React.ReactNode; className?: string }) {
-  return <div className="modal-layer"><button className="modal-backdrop" onClick={close} aria-label="Close modal" /><section className={`modal ${className}`}><header><div><h2>{title}</h2><p>{subtitle}</p></div><button className="icon-button" onClick={close}><X size={18} /></button></header>{children}</section></div>;
+function ModalShell({ title, subtitle, close, children, className = "", dismissible = true }: { title: string; subtitle: string; close: () => void; children: React.ReactNode; className?: string; dismissible?: boolean }) {
+  return <div className="modal-layer">{dismissible ? <button className="modal-backdrop" onClick={close} aria-label="Close modal" /> : <div className="modal-backdrop" />}<section className={`modal ${className}`}><header><div><h2>{title}</h2><p>{subtitle}</p></div>{dismissible && <button className="icon-button" onClick={close}><X size={18} /></button>}</header>{children}</section></div>;
 }
 
 function TaskModal({ data, projectId, close, save }: { data: WorkspaceData; projectId: string; close: () => void; save: (task: Task) => void }) {
@@ -469,7 +593,7 @@ function TaskModal({ data, projectId, close, save }: { data: WorkspaceData; proj
 
 type StarterTaskDraft = ImportedTask & { id: string };
 
-function ProjectModal({ data, close, save }: { data: WorkspaceData; close: () => void; save: (project: Project, tasks: Task[]) => void }) {
+function ProjectModal({ data, close, save, onboarding = false }: { data: WorkspaceData; close: () => void; save: (project: Project, tasks: Task[]) => void; onboarding?: boolean }) {
   const [step, setStep] = useState(1);
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
@@ -539,18 +663,19 @@ function ProjectModal({ data, close, save }: { data: WorkspaceData; close: () =>
     save(project, tasks);
   }
 
-  return <ModalShell title="Create a project" subtitle="Start with a proven plan, your spreadsheet, or a clean slate." close={close} className="project-setup-modal">
+  return <ModalShell title={onboarding ? "Set up your first project" : "Create a project"} subtitle={onboarding ? "Choose a template, import your existing work, or start clean." : "Start with a proven plan, your spreadsheet, or a clean slate."} close={close} className="project-setup-modal" dismissible={!onboarding}>
     <div className="setup-progress" aria-label={`Step ${step} of 3`}>{["Start", "Customize", "Review"].map((label, index) => <div className={step >= index + 1 ? "active" : ""} key={label}><span>{step > index + 1 ? <Check size={12} /> : index + 1}</span><small>{label}</small></div>)}</div>
     <form className="modal-form project-setup-form" onSubmit={submit}>
       {step === 1 && <div className="setup-step"><div className="setup-heading"><span><Sparkles size={16} /></span><div><h3>How would you like to start?</h3><p>You can edit every task before the project is created.</p></div></div><div className="template-grid">{projectTemplates.map((template) => <button type="button" className="template-card" key={template.id} onClick={() => applyTemplate(template)}><i style={{ background: template.color }}>{template.icon}</i><span><em>{template.category}</em><strong>{template.name}</strong><small>{template.description}</small><b>{template.tasks.length ? `${template.tasks.length} starter tasks` : "Add your own tasks"}</b></span><ChevronRight size={16} /></button>)}</div><div className="csv-import-card"><span className="csv-icon"><FileSpreadsheet size={22} /></span><div><strong>Import a task spreadsheet</strong><p>Upload a CSV and review every row before creating the project.</p><small>Columns: {csvColumns.join(", ")}</small>{importNote && <em className="import-note">{importNote}</em>}</div><div className="csv-actions"><label className="primary-button"><UploadCloud size={15} /> Choose CSV<input type="file" accept=".csv,text/csv" onChange={(event) => importFile(event.target.files?.[0])} /></label><button type="button" className="secondary-button" onClick={downloadSample}><FileDown size={14} /> Sample</button></div></div></div>}
       {step === 2 && <div className="setup-step"><div className="setup-heading"><span><FolderPlus size={16} /></span><div><h3>Customize your project</h3><p>Started from {sourceLabel}. Adjust the details and starter tasks.</p></div></div><div className="project-detail-grid"><label>Project name<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Fall campaign" required /></label><label>Target date<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label><label className="wide">Description<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="What are you trying to accomplish?" rows={2} /></label><label>Project color<input className="color-input" type="color" value={color} onChange={(event) => setColor(event.target.value)} /></label></div><div className="starter-task-section"><header><div><h3>Starter tasks <span>{drafts.length}</span></h3><p>Create the first assignments now, or add them later.</p></div><button type="button" className="secondary-button" onClick={addDraft}><Plus size={14} /> Add task</button></header>{drafts.length ? <div className="starter-task-list">{drafts.map((draft, index) => <div className="starter-task-row" key={draft.id}><span className="task-number">{index + 1}</span><input className="starter-title" aria-label={`Task ${index + 1} title`} value={draft.title} onChange={(event) => updateDraft(draft.id, { title: event.target.value })} placeholder="Task name" required /><select aria-label={`Task ${index + 1} status`} value={draft.status} onChange={(event) => updateDraft(draft.id, { status: event.target.value as TaskStatus })}>{TASK_STATUSES.map((status) => <option key={status}>{status}</option>)}</select><select aria-label={`Task ${index + 1} priority`} value={draft.priority} onChange={(event) => updateDraft(draft.id, { priority: event.target.value as Priority })}>{PRIORITIES.map((priority) => <option key={priority}>{priority}</option>)}</select><select aria-label={`Task ${index + 1} assignee`} value={draft.assigneeId} onChange={(event) => updateDraft(draft.id, { assigneeId: event.target.value })}>{data.members.map((member) => <option value={member.id} key={member.id}>{member.name}</option>)}</select><input aria-label={`Task ${index + 1} due date`} type="date" value={draft.dueDate} onChange={(event) => updateDraft(draft.id, { dueDate: event.target.value })} /><button type="button" className="icon-button remove-draft" aria-label={`Remove ${draft.title || `task ${index + 1}`}`} onClick={() => setDrafts((current) => current.filter((item) => item.id !== draft.id))}><Trash2 size={15} /></button></div>)}</div> : <button type="button" className="empty-task-state" onClick={addDraft}><Plus size={18} /><strong>Add your first task</strong><small>Projects can also start empty.</small></button>}</div></div>}
       {step === 3 && <div className="setup-step review-step"><div className="setup-heading"><span><CheckCircle2 size={16} /></span><div><h3>Ready to create</h3><p>Here’s what Orbit will add to your workspace.</p></div></div><div className="project-review-card"><i style={{ background: color }}>{name.charAt(0).toUpperCase()}</i><div><span>PROJECT</span><h3>{name}</h3><p>{description || "A new team project."}</p><small><CalendarDays size={13} /> {formatDate(today())} – {formatDate(dueDate)}</small></div></div><div className="review-stats"><div><strong>{drafts.length}</strong><span>Starter tasks</span></div><div><strong>{drafts.reduce((sum, draft) => sum + draft.estimate, 0)}h</strong><span>Estimated work</span></div><div><strong>{new Set(drafts.map((draft) => draft.assigneeId)).size || 1}</strong><span>People assigned</span></div></div>{drafts.length > 0 && <div className="review-task-list">{drafts.slice(0, 6).map((draft) => <div key={draft.id}><StatusIcon status={draft.status} /><span><strong>{draft.title}</strong><small>{draft.priority} · due {dateLabel(draft.dueDate)}</small></span><Avatar member={data.members.find((member) => member.id === draft.assigneeId)} small /></div>)}{drafts.length > 6 && <p>+ {drafts.length - 6} more tasks</p>}</div>}</div>}
-      <footer className="setup-footer"><button type="button" className="secondary-button" onClick={step === 1 ? close : () => setStep((current) => current - 1)}>{step === 1 ? "Cancel" : "Back"}</button><span>Step {step} of 3</span>{step === 1 ? <span /> : step === 2 ? <button className="primary-button" type="submit" disabled={!name.trim() || drafts.some((draft) => !draft.title.trim())}>Review project <ArrowRight size={15} /></button> : <button className="primary-button" type="submit"><FolderPlus size={15} /> Create project</button>}</footer>
+      <footer className="setup-footer">{step === 1 && onboarding ? <span /> : <button type="button" className="secondary-button" onClick={step === 1 ? close : () => setStep((current) => current - 1)}>{step === 1 ? "Cancel" : "Back"}</button>}<span>Step {step} of 3</span>{step === 1 ? <span /> : step === 2 ? <button className="primary-button" type="submit" disabled={!name.trim() || drafts.some((draft) => !draft.title.trim())}>Review project <ArrowRight size={15} /></button> : <button className="primary-button" type="submit"><FolderPlus size={15} /> Create project</button>}</footer>
     </form>
   </ModalShell>;
 }
 
-function InviteModal({ close, save }: { close: () => void; save: (email: string, role: Role) => void }) {
-  const [email, setEmail] = useState(""); const [role, setRole] = useState<Role>("Member");
-  return <ModalShell title="Invite a teammate" subtitle="They’ll be added to this project and your workspace." close={close}><form className="modal-form" onSubmit={(event) => { event.preventDefault(); save(email.trim(), role); }}><label className="wide">Email address<input autoFocus type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="teammate@company.com" required /></label><label className="wide">Role<select value={role} onChange={(event) => setRole(event.target.value as Role)}><option>Admin</option><option>Member</option><option>Viewer</option></select><small className="field-help">Members can create and update tasks. Viewers have read-only access.</small></label><div className="invite-note"><UserPlus size={18} /><span><strong>Local preview</strong><p>The teammate is added to the demo immediately. Connect Firebase email delivery before production invitations.</p></span></div><footer><button type="button" className="secondary-button" onClick={close}>Cancel</button><button className="primary-button" type="submit">Send invite <ArrowRight size={16} /></button></footer></form></ModalShell>;
+function InviteModal({ dataMode, close, save }: { dataMode: "loading" | "local" | "firestore"; close: () => void; save: (email: string, role: Role) => Promise<void> }) {
+  const [email, setEmail] = useState(""); const [role, setRole] = useState<Role>("Member"); const [saving, setSaving] = useState(false); const [error, setError] = useState("");
+  async function submit(event: FormEvent) { event.preventDefault(); setSaving(true); setError(""); try { await save(email.trim(), role); } catch (caught) { setError(caught instanceof Error ? caught.message : "The invitation could not be sent."); setSaving(false); } }
+  return <ModalShell title="Invite a teammate" subtitle="They’ll be added after accepting the secure email invitation." close={close}><form className="modal-form" onSubmit={(event) => void submit(event)}><label className="wide">Email address<input autoFocus type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="teammate@company.com" required /></label><label className="wide">Role<select value={role} onChange={(event) => setRole(event.target.value as Role)}><option>Admin</option><option>Member</option><option>Viewer</option></select><small className="field-help">Members can create and update tasks. Viewers have read-only access.</small></label><div className="invite-note"><UserPlus size={18} /><span><strong>{dataMode === "firestore" ? "Invite-only access" : "Local preview"}</strong><p>{dataMode === "firestore" ? "The invitation remains valid until it is accepted or revoked. Email delivery uses the Firebase Trigger Email extension." : "The teammate is added to this browser demo immediately."}</p></span></div>{error && <p className="form-error">{error}</p>}<footer><button type="button" className="secondary-button" onClick={close}>Cancel</button><button className="primary-button" type="submit" disabled={saving || dataMode === "loading"}>{saving ? "Sending…" : dataMode === "firestore" ? "Send invitation" : "Add demo teammate"} <ArrowRight size={16} /></button></footer></form></ModalShell>;
 }

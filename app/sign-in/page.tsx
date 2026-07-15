@@ -2,11 +2,13 @@
 
 import { FormEvent, useState } from "react";
 import { ArrowRight, Check, Eye, EyeOff, Sparkles } from "lucide-react";
-import { GoogleAuthProvider, signInWithEmailAndPassword, signInWithPopup } from "firebase/auth";
+import { createUserWithEmailAndPassword, GoogleAuthProvider, signInWithEmailAndPassword, signInWithPopup, updateProfile } from "firebase/auth";
 import Link from "next/link";
 import { getFirebaseAuth, isFirebaseConfigured } from "@/lib/firebase";
 
 export default function SignInPage() {
+  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -18,9 +20,14 @@ export default function SignInPage() {
     setError("");
     try {
       await action();
-      window.location.href = "/";
+      const requested = new URLSearchParams(window.location.search).get("next");
+      window.location.href = requested?.startsWith("/") && !requested.startsWith("//") ? requested : "/";
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message.replace("Firebase: ", "") : "Sign in failed.");
+      const code = typeof caught === "object" && caught && "code" in caught ? String(caught.code) : "";
+      if (code === "auth/email-already-in-use") setError("An account already exists for this email. Choose Sign in instead.");
+      else if (code === "auth/invalid-credential") setError("That email or password is incorrect.");
+      else if (code === "auth/weak-password") setError("Use a password with at least 8 characters.");
+      else setError(caught instanceof Error ? caught.message.replace("Firebase: ", "") : "Authentication failed.");
     } finally {
       setLoading(false);
     }
@@ -33,7 +40,14 @@ export default function SignInPage() {
       window.location.href = "/";
       return;
     }
-    void finishSignIn(() => signInWithEmailAndPassword(auth, email, password));
+    if (mode === "signup") {
+      void finishSignIn(async () => {
+        const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
+        await updateProfile(credential.user, { displayName: name.trim() });
+      });
+      return;
+    }
+    void finishSignIn(() => signInWithEmailAndPassword(auth, email.trim(), password));
   }
 
   function googleSignIn() {
@@ -70,24 +84,26 @@ export default function SignInPage() {
           <div className="mobile-signin-brand">
             <span className="brand-mark"><Sparkles size={17} /></span> orbit
           </div>
-          <h2>Welcome back</h2>
-          <p>{isFirebaseConfigured ? "Sign in to continue to your workspace." : "Local demo mode is ready—use any details to continue."}</p>
+          <h2>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
+          <p>{isFirebaseConfigured ? (mode === "signin" ? "Sign in to continue to your workspace." : "Use the email address that received your Orbit invitation.") : "Local demo mode is ready—use any details to continue."}</p>
           <button className="google-button" onClick={googleSignIn} disabled={loading}>
             <span className="google-g">G</span> Continue with Google
           </button>
           <div className="divider"><span>or continue with email</span></div>
           <form onSubmit={submit}>
+            {mode === "signup" && <label>Full name<input type="text" value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" autoComplete="name" required /></label>}
             <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" required /></label>
             <label>Password
               <span className="password-field">
-                <input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" minLength={isFirebaseConfigured ? 6 : 1} required />
+                <input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : "Your password"} minLength={isFirebaseConfigured ? (mode === "signup" ? 8 : 6) : 1} autoComplete={mode === "signup" ? "new-password" : "current-password"} required />
                 <button type="button" aria-label="Toggle password visibility" onClick={() => setShowPassword((value) => !value)}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button>
               </span>
             </label>
             {error && <p className="form-error">{error}</p>}
-            <button className="primary-button signin-submit" type="submit" disabled={loading}>{loading ? "Signing in…" : "Sign in"}<ArrowRight size={16} /></button>
+            <button className="primary-button signin-submit" type="submit" disabled={loading}>{loading ? (mode === "signin" ? "Signing in…" : "Creating account…") : (mode === "signin" ? "Sign in" : "Create account")}<ArrowRight size={16} /></button>
           </form>
-          <p className="signin-footer">New to Orbit? <Link href="/">Open the local demo</Link></p>
+          <p className="signin-footer">{mode === "signin" ? "New to Orbit?" : "Already have an account?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); }}>{mode === "signin" ? "Create an account" : "Sign in"}</button></p>
+          <nav className="signin-legal"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><Link href="/support">Support</Link></nav>
         </div>
       </section>
     </main>
