@@ -1,0 +1,41 @@
+{
+  "name": "orbit-project-management",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:studio": "prisma studio",
+    "firebase:login": "npx --yes firebase-tools@15.23.0 login",
+    "firebase:emulators": "npx --yes firebase-tools@15.23.0 emulators:start"
+  },
+  "dependencies": {
+    "@prisma/client": "^6.14.0",
+    "firebase": "^12.16.0",
+    "lucide-react": "^0.468.0",
+    "next": "^15.5.0",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.1.0",
+    "@types/node": "^22.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "eslint": "^9.0.0",
+    "eslint-config-next": "^15.5.0",
+    "prisma": "^6.14.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.2.0"
+  },
+  "overrides": {
+    "postcss": "^8.5.19"
+  }
+}
