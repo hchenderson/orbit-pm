@@ -11,7 +11,7 @@ rulesSuite("Firestore security rules", () => {
 
   beforeAll(async () => {
     environment = await initializeTestEnvironment({
-      projectId: "orbit-pm-rules-test",
+      projectId: "orbit-pm-79c3b",
       firestore: { rules: readFileSync("firestore.rules", "utf8") },
     });
   });
@@ -57,5 +57,29 @@ rulesSuite("Firestore security rules", () => {
     const wrongDb = environment.authenticatedContext("wrong-user", { email: "wrong@example.com" }).firestore();
     await assertSucceeds(getDoc(doc(inviteeDb, "workspaces", "w1", "invitations", "invite1")));
     await assertFails(getDoc(doc(wrongDb, "workspaces", "w1", "invitations", "invite1")));
+  });
+
+  it("allows editors to manage milestones and templates but blocks viewers", async () => {
+    const memberDb = environment.authenticatedContext("member").firestore();
+    const viewerDb = environment.authenticatedContext("viewer").firestore();
+    await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "milestones", "m1"), { id: "m1", projectId: "p1", name: "Launch" }));
+    await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "templates", "tpl1"), { id: "tpl1", name: "Launch plan" }));
+    await assertFails(setDoc(doc(viewerDb, "workspaces", "w1", "milestones", "m2"), { id: "m2", projectId: "p1", name: "Private" }));
+  });
+
+  it("keeps saved views private to their owner", async () => {
+    const memberDb = environment.authenticatedContext("member").firestore();
+    const ownerDb = environment.authenticatedContext("owner").firestore();
+    await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "savedViews", "v1"), { id: "v1", ownerId: "member", name: "Mine" }));
+    await assertSucceeds(getDoc(doc(memberDb, "workspaces", "w1", "savedViews", "v1")));
+    await assertFails(getDoc(doc(ownerDb, "workspaces", "w1", "savedViews", "v1")));
+  });
+
+  it("allows editors to notify workspace members and blocks viewers", async () => {
+    const memberDb = environment.authenticatedContext("member").firestore();
+    const viewerDb = environment.authenticatedContext("viewer").firestore();
+    const notification = { id: "n1", recipientId: "owner", taskId: "t1", title: "Mention", body: "You were mentioned", time: "Just now", read: false, tone: "purple" };
+    await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "notifications", "n1"), notification));
+    await assertFails(setDoc(doc(viewerDb, "workspaces", "w1", "notifications", "n2"), { ...notification, id: "n2" }));
   });
 });

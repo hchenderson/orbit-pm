@@ -13,9 +13,9 @@ import {
   type Unsubscribe,
 } from "firebase/firestore";
 import { seedData } from "./seed";
-import type { Member, Notification, Project, Task, WorkspaceData } from "./types";
+import type { CustomTemplate, Member, Milestone, Notification, Project, SavedView, Task, WorkspaceData } from "./types";
 
-type CollectionName = "members" | "projects" | "tasks" | "notifications";
+type CollectionName = "members" | "projects" | "tasks" | "notifications" | "milestones" | "savedViews" | "templates";
 
 interface WorkspaceDocument {
   workspaceName: string;
@@ -58,6 +58,9 @@ function initialWorkspace(user: User): WorkspaceData {
     projects: [],
     tasks: [],
     notifications: [],
+    milestones: [],
+    savedViews: [],
+    customTemplates: [],
   };
 }
 
@@ -88,6 +91,9 @@ export async function ensureUserWorkspace(db: Firestore, user: User) {
   for (const project of data.projects) contentBatch.set(doc(db, "workspaces", workspaceId, "projects", project.id), project);
   for (const task of data.tasks) contentBatch.set(doc(db, "workspaces", workspaceId, "tasks", task.id), withoutUndefined(task));
   for (const notification of data.notifications) contentBatch.set(doc(db, "workspaces", workspaceId, "notifications", notification.id), { ...notification, recipientId: user.uid });
+  for (const milestone of data.milestones) contentBatch.set(doc(db, "workspaces", workspaceId, "milestones", milestone.id), milestone);
+  for (const savedView of data.savedViews) contentBatch.set(doc(db, "workspaces", workspaceId, "savedViews", savedView.id), savedView);
+  for (const template of data.customTemplates) contentBatch.set(doc(db, "workspaces", workspaceId, "templates", template.id), template);
   await contentBatch.commit();
   return workspaceId;
 }
@@ -98,11 +104,14 @@ export function subscribeToWorkspace(db: Firestore, workspaceId: string, userId:
   let projects: Project[] = [];
   let tasks: Task[] = [];
   let notifications: Notification[] = [];
+  let milestones: Milestone[] = [];
+  let savedViews: SavedView[] = [];
+  let customTemplates: CustomTemplate[] = [];
   const ready = new Set<string>();
 
   function emit(key: string) {
     ready.add(key);
-    if (workspace && ready.size === 5) onData({ workspaceName: workspace.workspaceName, settings: workspace.settings, members, projects, tasks, notifications });
+    if (workspace && ready.size === 8) onData({ workspaceName: workspace.workspaceName, settings: workspace.settings, members, projects, tasks, notifications, milestones, savedViews, customTemplates });
   }
 
   const fail = (error: Error) => onError(error);
@@ -110,8 +119,11 @@ export function subscribeToWorkspace(db: Firestore, workspaceId: string, userId:
     onSnapshot(doc(db, "workspaces", workspaceId), (snapshot) => { workspace = snapshot.data() as WorkspaceDocument; emit("workspace"); }, fail),
     onSnapshot(collection(db, "workspaces", workspaceId, "members"), (snapshot) => { members = snapshot.docs.map((item) => item.data() as Member); emit("members"); }, fail),
     onSnapshot(collection(db, "workspaces", workspaceId, "projects"), (snapshot) => { projects = snapshot.docs.map((item) => item.data() as Project); emit("projects"); }, fail),
-    onSnapshot(collection(db, "workspaces", workspaceId, "tasks"), (snapshot) => { tasks = snapshot.docs.map((item) => item.data() as Task); emit("tasks"); }, fail),
-    onSnapshot(query(collection(db, "workspaces", workspaceId, "notifications"), where("recipientId", "==", userId)), (snapshot) => { notifications = snapshot.docs.map((item) => { const value = item.data(); return { id: value.id, title: value.title, body: value.body, time: value.time, read: value.read, tone: value.tone } as Notification; }); emit("notifications"); }, fail),
+    onSnapshot(collection(db, "workspaces", workspaceId, "tasks"), (snapshot) => { tasks = snapshot.docs.map((item) => { const value = item.data() as Task; return { ...value, subtasks: value.subtasks ?? [], commentItems: value.commentItems ?? [], attachmentItems: value.attachmentItems ?? [], activity: value.activity ?? [], dependencyIds: value.dependencyIds ?? (value.dependencyId ? [value.dependencyId] : []) }; }); emit("tasks"); }, fail),
+    onSnapshot(query(collection(db, "workspaces", workspaceId, "notifications"), where("recipientId", "==", userId)), (snapshot) => { notifications = snapshot.docs.map((item) => item.data() as Notification); emit("notifications"); }, fail),
+    onSnapshot(collection(db, "workspaces", workspaceId, "milestones"), (snapshot) => { milestones = snapshot.docs.map((item) => item.data() as Milestone); emit("milestones"); }, fail),
+    onSnapshot(query(collection(db, "workspaces", workspaceId, "savedViews"), where("ownerId", "==", userId)), (snapshot) => { savedViews = snapshot.docs.map((item) => item.data() as SavedView); emit("savedViews"); }, fail),
+    onSnapshot(collection(db, "workspaces", workspaceId, "templates"), (snapshot) => { customTemplates = snapshot.docs.map((item) => item.data() as CustomTemplate); emit("templates"); }, fail),
   ];
   return () => unsubscribes.forEach((unsubscribe) => unsubscribe());
 }
@@ -144,6 +156,9 @@ export async function syncWorkspace(db: Firestore, workspaceId: string, userId: 
   operations.push(syncCollection(db, workspaceId, "members", previous.members, next.members));
   operations.push(syncCollection(db, workspaceId, "projects", previous.projects, next.projects));
   operations.push(syncCollection(db, workspaceId, "tasks", previous.tasks, next.tasks));
-  operations.push(syncCollection(db, workspaceId, "notifications", previous.notifications, next.notifications, (notification) => ({ ...notification, recipientId: userId })));
+  operations.push(syncCollection(db, workspaceId, "notifications", previous.notifications, next.notifications, (notification) => ({ ...notification, recipientId: notification.recipientId ?? userId })));
+  operations.push(syncCollection(db, workspaceId, "milestones", previous.milestones ?? [], next.milestones ?? []));
+  operations.push(syncCollection(db, workspaceId, "savedViews", previous.savedViews ?? [], next.savedViews ?? []));
+  operations.push(syncCollection(db, workspaceId, "templates", previous.customTemplates ?? [], next.customTemplates ?? []));
   await Promise.all(operations);
 }

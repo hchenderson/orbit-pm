@@ -1,6 +1,6 @@
 import type { User } from "firebase/auth";
-import { doc, getDoc, updateDoc, writeBatch, type Firestore } from "firebase/firestore";
-import type { Member, Role } from "./types";
+import { collection, doc, getDoc, getDocs, onSnapshot, updateDoc, writeBatch, type Firestore, type Unsubscribe } from "firebase/firestore";
+import type { Member, Role, WorkspaceInvitation } from "./types";
 
 function randomToken() {
   const bytes = crypto.getRandomValues(new Uint8Array(32));
@@ -19,6 +19,10 @@ function memberFromUser(user: User, role: Role, invitationId: string): Member & 
 
 export async function createWorkspaceInvitation(db: Firestore, workspaceId: string, inviter: Member, email: string, role: Role) {
   const normalizedEmail = email.trim().toLowerCase();
+  const existing = await getDocs(collection(db, "workspaces", workspaceId, "invitations"));
+  if (existing.docs.some((item) => item.data().email === normalizedEmail && item.data().status === "pending")) {
+    throw new Error(`A pending invitation already exists for ${normalizedEmail}. Resend or revoke it from People.`);
+  }
   const token = randomToken();
   const invitationId = await tokenHash(token);
   const invitationUrl = `${window.location.origin}/invite?workspace=${encodeURIComponent(workspaceId)}&token=${token}`;
@@ -65,4 +69,18 @@ export async function acceptWorkspaceInvitation(db: Firestore, user: User, works
 
 export async function revokeWorkspaceInvitation(db: Firestore, workspaceId: string, invitationId: string) {
   await updateDoc(doc(db, "workspaces", workspaceId, "invitations", invitationId), { status: "revoked", revokedAt: new Date().toISOString() });
+}
+
+export async function resendWorkspaceInvitation(db: Firestore, workspaceId: string, inviter: Member, invitation: WorkspaceInvitation) {
+  await revokeWorkspaceInvitation(db, workspaceId, invitation.id);
+  return createWorkspaceInvitation(db, workspaceId, inviter, invitation.email, invitation.role);
+}
+
+export function subscribeToWorkspaceInvitations(db: Firestore, workspaceId: string, onData: (invitations: WorkspaceInvitation[]) => void, onError: (error: Error) => void): Unsubscribe {
+  return onSnapshot(collection(db, "workspaces", workspaceId, "invitations"), (snapshot) => {
+    const invitations = snapshot.docs
+      .map((item) => ({ ...item.data(), id: item.id }) as WorkspaceInvitation)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    onData(invitations);
+  }, onError);
 }

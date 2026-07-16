@@ -2,12 +2,12 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { ArrowRight, Check, Eye, EyeOff, Sparkles } from "lucide-react";
-import { createUserWithEmailAndPassword, GoogleAuthProvider, onAuthStateChanged, signInWithEmailAndPassword, signInWithPopup, updateProfile } from "firebase/auth";
+import { createUserWithEmailAndPassword, GoogleAuthProvider, onAuthStateChanged, sendEmailVerification, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup, updateProfile } from "firebase/auth";
 import Link from "next/link";
 import { getFirebaseAuth, isFirebaseConfigured } from "@/lib/firebase";
 
 export default function SignInPage() {
-  const [mode, setMode] = useState<"signin" | "signup">("signin");
+  const [mode, setMode] = useState<"signin" | "signup" | "reset">("signin");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -16,6 +16,7 @@ export default function SignInPage() {
   const [loading, setLoading] = useState(false);
   const [switching, setSwitching] = useState(false);
   const [currentAccount, setCurrentAccount] = useState("");
+  const [message, setMessage] = useState("");
 
   useEffect(() => {
     const isSwitching = new URLSearchParams(window.location.search).get("switch") === "1";
@@ -29,6 +30,7 @@ export default function SignInPage() {
   async function finishSignIn(action: () => Promise<unknown>) {
     setLoading(true);
     setError("");
+    setMessage("");
     try {
       await action();
       const requested = new URLSearchParams(window.location.search).get("next");
@@ -52,10 +54,22 @@ export default function SignInPage() {
       window.location.href = "/";
       return;
     }
+    if (mode === "reset") {
+      setLoading(true);
+      setError("");
+      setMessage("");
+      void sendPasswordResetEmail(auth, email.trim()).then(() => {
+        setMessage("Password reset email sent. Check your inbox and spam folder.");
+      }).catch((caught: unknown) => {
+        setError(caught instanceof Error ? caught.message.replace("Firebase: ", "") : "The reset email could not be sent.");
+      }).finally(() => setLoading(false));
+      return;
+    }
     if (mode === "signup") {
       void finishSignIn(async () => {
         const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
         await updateProfile(credential.user, { displayName: name.trim() });
+        await sendEmailVerification(credential.user);
       });
       return;
     }
@@ -98,25 +112,29 @@ export default function SignInPage() {
           <div className="mobile-signin-brand">
             <span className="brand-mark"><Sparkles size={17} /></span> orbit
           </div>
-          <h2>{switching ? "Switch account" : mode === "signin" ? "Welcome back" : "Create your account"}</h2>
-          <p>{switching ? `Choose the account you want to use${currentAccount ? `. You are currently signed in as ${currentAccount}.` : "."}` : isFirebaseConfigured ? (mode === "signin" ? "Sign in to continue to your workspace." : "Use the email address that received your Orbit invitation.") : "Local demo mode is ready—use any details to continue."}</p>
+          <h2>{switching ? "Switch account" : mode === "signin" ? "Welcome back" : mode === "signup" ? "Create your account" : "Reset your password"}</h2>
+          <p>{switching ? `Choose the account you want to use${currentAccount ? `. You are currently signed in as ${currentAccount}.` : "."}` : mode === "reset" ? "We’ll email you a secure password-reset link." : isFirebaseConfigured ? (mode === "signin" ? "Sign in to continue to your workspace." : "Use the email address that received your Orbit invitation.") : "Local demo mode is ready—use any details to continue."}</p>
+          {mode !== "reset" && <>
           <button className="google-button" onClick={googleSignIn} disabled={loading}>
             <span className="google-g">G</span> {switching ? "Choose a Google account" : "Continue with Google"}
           </button>
           <div className="divider"><span>or continue with email</span></div>
+          </>}
           <form onSubmit={submit}>
             {mode === "signup" && <label>Full name<input type="text" value={name} onChange={(event) => setName(event.target.value)} placeholder="Your name" autoComplete="name" required /></label>}
             <label>Email address<input type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" required /></label>
-            <label>Password
+            {mode !== "reset" && <label>Password
               <span className="password-field">
                 <input type={showPassword ? "text" : "password"} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={mode === "signup" ? "At least 8 characters" : "Your password"} minLength={isFirebaseConfigured ? (mode === "signup" ? 8 : 6) : 1} autoComplete={mode === "signup" ? "new-password" : "current-password"} required />
                 <button type="button" aria-label="Toggle password visibility" onClick={() => setShowPassword((value) => !value)}>{showPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button>
               </span>
-            </label>
+            </label>}
+            {mode === "signin" && <button type="button" className="forgot-password" onClick={() => { setMode("reset"); setError(""); setMessage(""); }}>Forgot password?</button>}
             {error && <p className="form-error">{error}</p>}
-            <button className="primary-button signin-submit" type="submit" disabled={loading}>{loading ? (mode === "signin" ? "Signing in…" : "Creating account…") : (mode === "signin" ? "Sign in" : "Create account")}<ArrowRight size={16} /></button>
+            {message && <p className="form-success">{message}</p>}
+            <button className="primary-button signin-submit" type="submit" disabled={loading}>{loading ? (mode === "signin" ? "Signing in…" : mode === "signup" ? "Creating account…" : "Sending…") : (mode === "signin" ? "Sign in" : mode === "signup" ? "Create account" : "Send reset email")}<ArrowRight size={16} /></button>
           </form>
-          {switching ? <p className="signin-footer"><Link href="/">Cancel and keep current account</Link></p> : <p className="signin-footer">{mode === "signin" ? "New to Orbit?" : "Already have an account?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); }}>{mode === "signin" ? "Create an account" : "Sign in"}</button></p>}
+          {switching ? <p className="signin-footer"><Link href="/">Cancel and keep current account</Link></p> : <p className="signin-footer">{mode === "signin" ? "New to Orbit?" : mode === "signup" ? "Already have an account?" : "Remember your password?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); setMessage(""); }}>{mode === "signin" ? "Create an account" : "Sign in"}</button></p>}
           <nav className="signin-legal"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><Link href="/support">Support</Link></nav>
         </div>
       </section>

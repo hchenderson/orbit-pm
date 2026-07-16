@@ -97,7 +97,14 @@ service cloud.firestore {
         allow read: if isMember(workspaceId)
           && resource.data.recipientId == request.auth.uid;
         allow create: if canManage(workspaceId)
-          || (isMember(workspaceId) && request.resource.data.recipientId == request.auth.uid);
+          || (
+            canEdit(workspaceId)
+            && request.resource.data.recipientId is string
+            && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.resource.data.recipientId))
+            && request.resource.data.title is string
+            && request.resource.data.body is string
+            && request.resource.data.keys().hasOnly(['id', 'recipientId', 'taskId', 'title', 'body', 'time', 'read', 'tone'])
+          );
         allow update, delete: if isMember(workspaceId)
           && resource.data.recipientId == request.auth.uid
           && request.resource.data.recipientId == resource.data.recipientId;
@@ -117,6 +124,36 @@ service cloud.firestore {
             && request.resource.data.status == 'accepted'
             && request.resource.data.acceptedBy == request.auth.uid
           );
+      }
+
+      match /milestones/{milestoneId} {
+        allow read: if isMember(workspaceId);
+        allow create, update: if canEdit(workspaceId)
+          && request.resource.data.id == milestoneId
+          && request.resource.data.projectId is string
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0;
+        allow delete: if canEdit(workspaceId);
+      }
+
+      match /savedViews/{viewId} {
+        allow read: if isMember(workspaceId)
+          && resource.data.ownerId == request.auth.uid;
+        allow create: if isMember(workspaceId)
+          && request.resource.data.id == viewId
+          && request.resource.data.ownerId == request.auth.uid;
+        allow update, delete: if isMember(workspaceId)
+          && resource.data.ownerId == request.auth.uid
+          && request.resource.data.ownerId == resource.data.ownerId;
+      }
+
+      match /templates/{templateId} {
+        allow read: if isMember(workspaceId);
+        allow create, update: if canEdit(workspaceId)
+          && request.resource.data.id == templateId
+          && request.resource.data.name is string
+          && request.resource.data.name.size() > 0;
+        allow delete: if canEdit(workspaceId);
       }
     }
 

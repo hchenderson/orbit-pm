@@ -8,7 +8,7 @@
     "start": "next start",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:rules": "npx --yes firebase-tools@15.23.0 emulators:exec --only firestore \"vitest run tests/firestore.rules.test.ts\"",
+    "test:rules": "npx --yes firebase-tools@15.23.0 emulators:exec --only firestore,storage \"vitest run --maxWorkers=1 --no-file-parallelism tests/firestore.rules.test.ts tests/storage.rules.test.ts\"",
     "db:generate": "prisma generate",
     "db:push": "prisma db push",
     "db:migrate": "prisma migrate dev",
