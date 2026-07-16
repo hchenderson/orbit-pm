@@ -39,7 +39,8 @@ function initialWorkspace(user: User): WorkspaceData {
     color: "#6857d9",
     role: "Owner",
     preferences: {
-      reminderHoursBefore: 24,
+      reminderDaysBefore: 1,
+      reminderTime: "09:00",
       timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
       dailyDigestTime: "08:00",
       reminderEmail: true,

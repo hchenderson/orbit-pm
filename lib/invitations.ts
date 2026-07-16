@@ -14,7 +14,7 @@ async function tokenHash(token: string) {
 
 function memberFromUser(user: User, role: Role, invitationId: string): Member & { invitationId: string } {
   const name = user.displayName?.trim() || user.email?.split("@")[0] || "Orbit User";
-  return { id: user.uid, name, email: user.email ?? "", initials: name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(), color: "#4d799f", role, invitationId, preferences: { reminderHoursBefore: 24, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", dailyDigestTime: "08:00", reminderEmail: true, reminderInApp: true, dailyDigest: true, assignmentEmails: true, mentionEmails: true, overdueEmails: true } };
+  return { id: user.uid, name, email: user.email ?? "", initials: name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase(), color: "#4d799f", role, invitationId, preferences: { reminderDaysBefore: 1, reminderTime: "09:00", timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC", dailyDigestTime: "08:00", reminderEmail: true, reminderInApp: true, dailyDigest: true, assignmentEmails: true, mentionEmails: true, overdueEmails: true } };
 }
 
 export async function createWorkspaceInvitation(db: Firestore, workspaceId: string, inviter: Member, email: string, role: Role) {

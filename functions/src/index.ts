@@ -7,6 +7,9 @@ import { DateTime } from "luxon";
 initializeApp();
 
 interface Preferences {
+  reminderDaysBefore?: number;
+  reminderTime?: string;
+  // Used only to migrate preferences saved before reminders changed from hours to days.
   reminderHoursBefore?: number;
   timezone?: string;
   dailyDigestTime?: string;
@@ -32,15 +35,16 @@ interface TaskData {
   assigneeId: string;
 }
 
-const defaults: Required<Preferences> = {
-  reminderHoursBefore: 24,
+const defaults = {
+  reminderDaysBefore: 1,
+  reminderTime: "09:00",
   timezone: "UTC",
   dailyDigestTime: "08:00",
   reminderEmail: true,
   reminderInApp: true,
   dailyDigest: true,
   overdueEmails: true,
-};
+} satisfies Required<Omit<Preferences, "reminderHoursBefore">>;
 
 function safeZone(zone?: string) {
   const candidate = zone || "UTC";
@@ -78,19 +82,26 @@ export const processReminders = onSchedule({ schedule: "every 15 minutes", timeZ
 
     for (const member of members) {
       if (!member.email) continue;
-      const preferences = { ...defaults, ...member.preferences };
+      const storedPreferences = member.preferences ?? {};
+      const preferences = {
+        ...defaults,
+        ...storedPreferences,
+        reminderDaysBefore: storedPreferences.reminderDaysBefore ?? Math.ceil((storedPreferences.reminderHoursBefore ?? 24) / 24),
+      };
       const zone = safeZone(preferences.timezone);
       const localNow = nowUtc.setZone(zone);
       const assigned = tasks.filter((task) => task.assigneeId === member.id);
 
       for (const task of assigned) {
-        const due = DateTime.fromISO(`${task.dueDate}T17:00`, { zone });
+        const due = DateTime.fromISO(task.dueDate, { zone }).startOf("day");
         if (!due.isValid) continue;
-        const hoursUntilDue = due.diff(localNow, "hours").hours;
-        if (hoursUntilDue > preferences.reminderHoursBefore || hoursUntilDue < -24) continue;
-        const deliveryId = `reminder_${member.id}_${task.id}_${task.dueDate}_${preferences.reminderHoursBefore}`.replace(/[^a-zA-Z0-9_-]/g, "_");
-        const notification = preferences.reminderInApp ? { id: deliveryId, recipientId: member.id, title: hoursUntilDue < 0 ? "Task overdue" : "Task due soon", body: `${task.title} is due ${due.toLocaleString(DateTime.DATE_MED)}`, time: "Just now", read: false, tone: hoursUntilDue < 0 ? "red" : "amber" } : null;
-        const email = preferences.reminderEmail ? { to: [member.email], template: { name: "task-reminder", data: { memberName: member.name, taskTitle: task.title, dueDate: due.toLocaleString(DateTime.DATETIME_MED), overdue: hoursUntilDue < 0 } } } : null;
+        const [reminderHour, reminderMinute] = preferences.reminderTime.split(":").map(Number);
+        const reminderAt = due.minus({ days: preferences.reminderDaysBefore }).set({ hour: Number.isFinite(reminderHour) ? reminderHour : 9, minute: Number.isFinite(reminderMinute) ? reminderMinute : 0, second: 0, millisecond: 0 });
+        const minutesSinceReminder = localNow.diff(reminderAt, "minutes").minutes;
+        if (minutesSinceReminder < 0 || minutesSinceReminder >= 15) continue;
+        const deliveryId = `reminder_${member.id}_${task.id}_${task.dueDate}_${preferences.reminderDaysBefore}_${preferences.reminderTime}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+        const notification = preferences.reminderInApp ? { id: deliveryId, recipientId: member.id, title: "Task due soon", body: `${task.title} is due ${due.toLocaleString(DateTime.DATE_MED)}`, time: "Just now", read: false, tone: "amber" } : null;
+        const email = preferences.reminderEmail ? { to: [member.email], template: { name: "task-reminder", data: { memberName: member.name, taskTitle: task.title, dueDate: due.toLocaleString(DateTime.DATE_MED), overdue: false } } } : null;
         if (notification || email) { await deliverOnce(db, workspaceRef, deliveryId, notification, email); deliveries += 1; }
       }
 

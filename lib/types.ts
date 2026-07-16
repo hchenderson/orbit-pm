@@ -6,7 +6,8 @@ export type ViewMode = "overview" | "list" | "board" | "timeline" | "table" | "c
 export interface WorkspaceSettings {
   defaultView: ViewMode;
   reminderTiming: "1 hour" | "1 day" | "2 days";
-  reminderHoursBefore: number;
+  reminderDaysBefore: number;
+  reminderTime: string;
   timezone: string;
   dailyDigestTime: string;
   reminderEmail: boolean;
@@ -19,7 +20,8 @@ export interface WorkspaceSettings {
 }
 
 export interface UserNotificationPreferences {
-  reminderHoursBefore: number;
+  reminderDaysBefore: number;
+  reminderTime: string;
   timezone: string;
   dailyDigestTime: string;
   reminderEmail: boolean;

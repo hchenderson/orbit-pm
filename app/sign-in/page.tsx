@@ -1,8 +1,8 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { ArrowRight, Check, Eye, EyeOff, Sparkles } from "lucide-react";
-import { createUserWithEmailAndPassword, GoogleAuthProvider, signInWithEmailAndPassword, signInWithPopup, updateProfile } from "firebase/auth";
+import { createUserWithEmailAndPassword, GoogleAuthProvider, onAuthStateChanged, signInWithEmailAndPassword, signInWithPopup, updateProfile } from "firebase/auth";
 import Link from "next/link";
 import { getFirebaseAuth, isFirebaseConfigured } from "@/lib/firebase";
 
@@ -14,6 +14,17 @@ export default function SignInPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [switching, setSwitching] = useState(false);
+  const [currentAccount, setCurrentAccount] = useState("");
+
+  useEffect(() => {
+    const isSwitching = new URLSearchParams(window.location.search).get("switch") === "1";
+    setSwitching(isSwitching);
+    if (!isSwitching) return;
+    const auth = getFirebaseAuth();
+    if (!auth) return;
+    return onAuthStateChanged(auth, (user) => setCurrentAccount(user ? user.email ?? user.displayName ?? "your current account" : ""));
+  }, []);
 
   async function finishSignIn(action: () => Promise<unknown>) {
     setLoading(true);
@@ -27,6 +38,7 @@ export default function SignInPage() {
       if (code === "auth/email-already-in-use") setError("An account already exists for this email. Choose Sign in instead.");
       else if (code === "auth/invalid-credential") setError("That email or password is incorrect.");
       else if (code === "auth/weak-password") setError("Use a password with at least 8 characters.");
+      else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") setError("Account switching was cancelled. Your current account is still signed in.");
       else setError(caught instanceof Error ? caught.message.replace("Firebase: ", "") : "Authentication failed.");
     } finally {
       setLoading(false);
@@ -56,7 +68,9 @@ export default function SignInPage() {
       window.location.href = "/";
       return;
     }
-    void finishSignIn(() => signInWithPopup(auth, new GoogleAuthProvider()));
+    const provider = new GoogleAuthProvider();
+    if (switching) provider.setCustomParameters({ prompt: "select_account" });
+    void finishSignIn(() => signInWithPopup(auth, provider));
   }
 
   return (
@@ -84,10 +98,10 @@ export default function SignInPage() {
           <div className="mobile-signin-brand">
             <span className="brand-mark"><Sparkles size={17} /></span> orbit
           </div>
-          <h2>{mode === "signin" ? "Welcome back" : "Create your account"}</h2>
-          <p>{isFirebaseConfigured ? (mode === "signin" ? "Sign in to continue to your workspace." : "Use the email address that received your Orbit invitation.") : "Local demo mode is ready—use any details to continue."}</p>
+          <h2>{switching ? "Switch account" : mode === "signin" ? "Welcome back" : "Create your account"}</h2>
+          <p>{switching ? `Choose the account you want to use${currentAccount ? `. You are currently signed in as ${currentAccount}.` : "."}` : isFirebaseConfigured ? (mode === "signin" ? "Sign in to continue to your workspace." : "Use the email address that received your Orbit invitation.") : "Local demo mode is ready—use any details to continue."}</p>
           <button className="google-button" onClick={googleSignIn} disabled={loading}>
-            <span className="google-g">G</span> Continue with Google
+            <span className="google-g">G</span> {switching ? "Choose a Google account" : "Continue with Google"}
           </button>
           <div className="divider"><span>or continue with email</span></div>
           <form onSubmit={submit}>
@@ -102,7 +116,7 @@ export default function SignInPage() {
             {error && <p className="form-error">{error}</p>}
             <button className="primary-button signin-submit" type="submit" disabled={loading}>{loading ? (mode === "signin" ? "Signing in…" : "Creating account…") : (mode === "signin" ? "Sign in" : "Create account")}<ArrowRight size={16} /></button>
           </form>
-          <p className="signin-footer">{mode === "signin" ? "New to Orbit?" : "Already have an account?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); }}>{mode === "signin" ? "Create an account" : "Sign in"}</button></p>
+          {switching ? <p className="signin-footer"><Link href="/">Cancel and keep current account</Link></p> : <p className="signin-footer">{mode === "signin" ? "New to Orbit?" : "Already have an account?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); }}>{mode === "signin" ? "Create an account" : "Sign in"}</button></p>}
           <nav className="signin-legal"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><Link href="/support">Support</Link></nav>
         </div>
       </section>
