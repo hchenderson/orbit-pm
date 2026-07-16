@@ -134,17 +134,24 @@ export const projectTemplates: ProjectTemplate[] = [
 ];
 
 export const csvColumns = [
+  "wbs",
   "title",
+  "parent_task",
+  "task_type",
   "description",
   "status",
   "priority",
   "assignee",
+  "duration_days",
+  "predecessors",
   "start_date",
   "due_date",
   "estimate",
   "labels",
+  "project_notes",
 ] as const;
 
-export const sampleCsv = `title,description,status,priority,assignee,start_date,due_date,estimate,labels
-Kick off project,Align scope and owners,Not Started,High,carter@example.com,2026-08-03,2026-08-03,2,"Planning,Meeting"
-Draft project plan,Define milestones and dependencies,Not Started,Medium,carter@example.com,2026-08-04,2026-08-07,4,Planning`;
+export const sampleCsv = `wbs,title,parent_task,task_type,description,status,priority,assignee,duration_days,predecessors,start_date,due_date,estimate,labels,project_notes
+1,Launch campaign,,Parent Task,Coordinate the complete campaign,Not Started,High,,8,,2026-08-03,2026-08-12,0,Campaign,Example project imported with hierarchy and dependencies
+1.1,Draft copy,Launch campaign,Draft,Write and approve campaign copy,Not Started,High,,3,,2026-08-03,2026-08-05,4,"Campaign,Writing",
+1.2,Create layout,Launch campaign,Layout,Design the approved campaign,Not Started,Medium,,2,1.1,2026-08-06,2026-08-07,4,"Campaign,Design",`;
