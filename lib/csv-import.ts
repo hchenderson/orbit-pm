@@ -8,14 +8,19 @@ export interface ImportedTask {
   assigneeId: string;
   startDate: string;
   dueDate: string;
+  durationDays: number;
   estimate: number;
   labels: string[];
+  sourceId?: string;
+  parentIndex?: number;
+  dependencyIndexes?: number[];
 }
 
 export interface CsvImportResult {
   tasks: ImportedTask[];
   warnings: string[];
   skipped: number;
+  projectNotes: string;
 }
 
 const headerAliases: Record<string, string> = {
@@ -26,6 +31,11 @@ const headerAliases: Record<string, string> = {
   due: "due_date", duedate: "due_date", deadline: "due_date",
   effort: "estimate", hours: "estimate",
   tag: "labels", tags: "labels",
+  id: "wbs", outline: "wbs", task_id: "wbs", task_number: "wbs",
+  parent: "parent_task", parenttask: "parent_task", summary_task: "parent_task",
+  predecessor: "predecessors", predecessor_ids: "predecessors", dependency: "predecessors", dependencies: "predecessors", depends_on: "predecessors",
+  duration: "duration_days", days: "duration_days", duration_in_days: "duration_days",
+  project_note: "project_notes",
 };
 
 function normalizeHeader(value: string) {
@@ -78,18 +88,58 @@ function addDays(value: string, offset: number) {
   return [date.getFullYear(), String(date.getMonth() + 1).padStart(2, "0"), String(date.getDate()).padStart(2, "0")].join("-");
 }
 
+function inclusiveDuration(startDate: string, dueDate: string) {
+  const start = new Date(`${startDate}T12:00:00`).getTime();
+  const due = new Date(`${dueDate}T12:00:00`).getTime();
+  return Math.max(1, Math.round((due - start) / 86400000) + 1);
+}
+
+function referenceKey(value: string) {
+  return value.trim().toLowerCase().replace(/\s+/g, " ");
+}
+
+function splitReferences(value: string) {
+  return value.split(/[;,|]/).map((reference) => reference.trim()).filter(Boolean);
+}
+
+function parentCreatesCycle(tasks: ImportedTask[], taskIndex: number, parentIndex: number) {
+  const visited = new Set<number>([taskIndex]);
+  let current: number | undefined = parentIndex;
+  while (current !== undefined) {
+    if (visited.has(current)) return true;
+    visited.add(current);
+    current = tasks[current]?.parentIndex;
+  }
+  return false;
+}
+
+function dependencyCreatesCycle(tasks: ImportedTask[], taskIndex: number, dependencyIndex: number) {
+  const pending = [dependencyIndex];
+  const visited = new Set<number>();
+  while (pending.length) {
+    const current = pending.pop()!;
+    if (current === taskIndex) return true;
+    if (visited.has(current)) continue;
+    visited.add(current);
+    pending.push(...(tasks[current]?.dependencyIndexes ?? []));
+  }
+  return false;
+}
+
 export function parseTaskCsv(text: string, members: Member[], defaultStartDate: string): CsvImportResult {
   const rows = parseRows(text.replace(/^\uFEFF/, ""));
-  if (!rows.length) return { tasks: [], warnings: ["The CSV file is empty."], skipped: 0 };
+  if (!rows.length) return { tasks: [], warnings: ["The CSV file is empty."], skipped: 0, projectNotes: "" };
 
   const headers = rows[0].map(normalizeHeader);
   if (!headers.includes("title")) {
-    return { tasks: [], warnings: ["Add a title, task, task_name, or name column before importing."], skipped: Math.max(0, rows.length - 1) };
+    return { tasks: [], warnings: ["Add a title, task, task_name, or name column before importing."], skipped: Math.max(0, rows.length - 1), projectNotes: "" };
   }
 
   const warnings: string[] = [];
   let skipped = 0;
-  const tasks = rows.slice(1).flatMap((values, rowIndex) => {
+  const references: { parent: string; predecessors: string[]; row: number }[] = [];
+  let projectNotes = "";
+  const tasks: ImportedTask[] = rows.slice(1).flatMap((values, rowIndex) => {
     const record = Object.fromEntries(headers.map((header, index) => [header, values[index]?.trim() ?? ""]));
     if (!record.title) {
       skipped += 1;
@@ -100,15 +150,25 @@ export function parseTaskCsv(text: string, members: Member[], defaultStartDate: 
       .find((item) => item.toLowerCase() === record.status?.toLowerCase()) ?? "Not Started";
     const priority = (["Low", "Medium", "High", "Urgent"] as Priority[])
       .find((item) => item.toLowerCase() === record.priority?.toLowerCase()) ?? "Medium";
-    const assignee = members.find((member) =>
+    const matchedAssignee = members.find((member) =>
       member.email.toLowerCase() === record.assignee?.toLowerCase()
       || member.name.toLowerCase() === record.assignee?.toLowerCase(),
-    ) ?? members[0];
+    );
+    const assignee = record.assignee ? matchedAssignee ?? members[0] : undefined;
     const startDate = validDate(record.start_date ?? "", defaultStartDate);
-    const dueDate = validDate(record.due_date ?? "", addDays(startDate, 7));
+    const parsedDuration = Number(record.duration_days);
+    const explicitDuration = Number.isFinite(parsedDuration) && parsedDuration >= 1 ? Math.floor(parsedDuration) : undefined;
+    const importedDueDate = validDate(record.due_date ?? "", "");
+    const dueDate = importedDueDate || addDays(startDate, explicitDuration ? explicitDuration - 1 : 7);
+    const durationDays = explicitDuration ?? inclusiveDuration(startDate, dueDate);
     const estimate = Number(record.estimate);
+    const taskType = record.task_type?.trim();
+    const labels = (record.labels ?? "").split(/[;,|]/).map((label) => label.trim()).filter(Boolean);
+    if (taskType && !labels.some((label) => label.toLowerCase() === taskType.toLowerCase())) labels.push(taskType);
+    if (!projectNotes && record.project_notes) projectNotes = record.project_notes;
+    references.push({ parent: record.parent_task ?? "", predecessors: splitReferences(record.predecessors ?? ""), row: rowIndex + 2 });
 
-    if (record.assignee && assignee === members[0] && ![members[0]?.email, members[0]?.name].some((value) => value?.toLowerCase() === record.assignee.toLowerCase())) {
+    if (record.assignee && !matchedAssignee) {
       warnings.push(`Row ${rowIndex + 2}: assignee “${record.assignee}” was not found, so it was assigned to ${members[0]?.name ?? "the project owner"}.`);
     }
 
@@ -120,10 +180,60 @@ export function parseTaskCsv(text: string, members: Member[], defaultStartDate: 
       assigneeId: assignee?.id ?? "",
       startDate,
       dueDate,
+      durationDays,
       estimate: Number.isFinite(estimate) && estimate >= 0 ? estimate : 0,
-      labels: (record.labels ?? "").split(/[;,|]/).map((label) => label.trim()).filter(Boolean),
+      labels,
+      sourceId: record.wbs || undefined,
     }];
   });
 
-  return { tasks, warnings: [...new Set(warnings)].slice(0, 4), skipped };
+  const sourceLookup = new Map<string, number>();
+  const titleLookup = new Map<string, number>();
+  tasks.forEach((task, index) => {
+    if (task.sourceId) {
+      const key = referenceKey(task.sourceId);
+      if (!sourceLookup.has(key)) sourceLookup.set(key, index);
+      else warnings.push(`Row ${references[index].row}: task reference “${task.sourceId}” is duplicated; the first match will be used.`);
+    }
+    const titleKey = referenceKey(task.title);
+    if (!titleLookup.has(titleKey)) titleLookup.set(titleKey, index);
+  });
+  const resolveReference = (reference: string) => sourceLookup.get(referenceKey(reference)) ?? titleLookup.get(referenceKey(reference));
+
+  tasks.forEach((task, index) => {
+    const reference = references[index];
+    if (reference.parent) {
+      const parentIndex = resolveReference(reference.parent);
+      if (parentIndex === undefined) warnings.push(`Row ${reference.row}: parent task “${reference.parent}” was not found.`);
+      else if (parentIndex === index) warnings.push(`Row ${reference.row}: a task cannot be its own parent.`);
+      else task.parentIndex = parentIndex;
+    }
+  });
+  tasks.forEach((task, index) => {
+    if (task.parentIndex !== undefined && parentCreatesCycle(tasks, index, task.parentIndex)) {
+      warnings.push(`Row ${references[index].row}: the parent relationship was ignored because it creates a cycle.`);
+      task.parentIndex = undefined;
+    }
+  });
+
+  tasks.forEach((task, index) => {
+    const dependencyIndexes: number[] = [];
+    for (const predecessor of references[index].predecessors) {
+      const dependencyIndex = resolveReference(predecessor);
+      if (dependencyIndex === undefined) {
+        warnings.push(`Row ${references[index].row}: predecessor “${predecessor}” was not found.`);
+        continue;
+      }
+      if (dependencyIndex === index || dependencyIndexes.includes(dependencyIndex)) continue;
+      task.dependencyIndexes = dependencyIndexes;
+      if (dependencyCreatesCycle(tasks, index, dependencyIndex)) {
+        warnings.push(`Row ${references[index].row}: predecessor “${predecessor}” was ignored because it creates a cycle.`);
+        continue;
+      }
+      dependencyIndexes.push(dependencyIndex);
+    }
+    task.dependencyIndexes = dependencyIndexes;
+  });
+
+  return { tasks, warnings: [...new Set(warnings)].slice(0, 6), skipped, projectNotes };
 }
