@@ -12,7 +12,10 @@ export const PRIORITIES: Priority[] = ["Low", "Medium", "High", "Urgent"];
 
 export function taskProgress(tasks: Task[]): number {
   if (!tasks.length) return 0;
-  return Math.round((tasks.filter((task) => task.status === "Complete").length / tasks.length) * 100);
+  const summaryIds = new Set(tasks.flatMap((task) => task.parentTaskId ? [task.parentTaskId] : []));
+  const workItems = tasks.filter((task) => !summaryIds.has(task.id));
+  if (!workItems.length) return 0;
+  return Math.round((workItems.filter((task) => task.status === "Complete").length / workItems.length) * 100);
 }
 
 export function isOverdue(task: Task, now = new Date()): boolean {

@@ -1,10 +1,18 @@
-import type { Metadata } from "next";
+import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
   title: "Orbit — Project management, simplified",
   description: "A calm, focused project workspace for small teams.",
   icons: { icon: "/favicon.svg" },
+  manifest: "/manifest.webmanifest",
+  appleWebApp: { capable: true, statusBarStyle: "default", title: "Orbit" },
+};
+
+export const viewport: Viewport = {
+  width: "device-width",
+  initialScale: 1,
+  themeColor: "#6857d9",
 };
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {

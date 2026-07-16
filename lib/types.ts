@@ -108,7 +108,10 @@ export interface Task {
   startDate: string;
   dueDate: string;
   estimate: number;
+  /** Calendar-day duration. Finish is calculated from start + duration. */
+  durationDays?: number;
   labels: string[];
+  /** Legacy embedded subtasks are migrated into Task documents with parentTaskId. */
   subtasks: TaskSubtask[];
   comments: number;
   attachments: number;
@@ -120,6 +123,7 @@ export interface Task {
   recurrenceGeneratedAt?: string;
   dependencyId?: string;
   dependencyIds?: string[];
+  parentTaskId?: string;
   milestoneId?: string;
   createdAt: string;
   updatedAt: string;

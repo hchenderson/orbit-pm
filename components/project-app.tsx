@@ -32,6 +32,8 @@ import {
   MessageSquare,
   MoreHorizontal,
   Paperclip,
+  PanelLeftClose,
+  PanelLeftOpen,
   Plus,
   RefreshCw,
   Repeat2,
@@ -50,6 +52,9 @@ import {
 } from "lucide-react";
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { seedData } from "@/lib/seed";
+import { ProjectCalendar } from "@/components/project-calendar";
+import { ScheduleTable } from "@/components/schedule-table";
+import { TaskDetailDrawer } from "@/components/task-detail-drawer";
 import { enableFirebaseAnalytics, enableFirebaseAppCheck, getFirebaseAuth, getFirebaseFirestore, getFirebaseStorage, isDemoMode, isFirebaseConfigured } from "@/lib/firebase";
 import { parseTaskCsv, type ImportedTask } from "@/lib/csv-import";
 import { csvColumns, projectTemplates, sampleCsv, type ProjectTemplate } from "@/lib/project-templates";
@@ -59,9 +64,11 @@ import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage
 import { ensureUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
 import { createWorkspaceInvitation, resendWorkspaceInvitation, revokeWorkspaceInvitation, subscribeToWorkspaceInvitations } from "@/lib/invitations";
 import { dateLabel, daysUntil, filterTasks, isDueToday, isOverdue, PRIORITIES, taskProgress, TASK_STATUSES } from "@/lib/task-utils";
+import { inclusiveDuration, migrateLegacySubtasks, recalculateProjectSchedule, taskDuration, taskOutline } from "@/lib/scheduling";
 import type { CustomTemplate, Member, Priority, Project, Role, SavedView, Task, TaskAttachment, TaskComment, TaskStatus, ViewMode, WorkspaceData, WorkspaceInvitation } from "@/lib/types";
 
 const STORAGE_KEY = "orbit-workspace-v1";
+const SIDEBAR_KEY = "orbit-sidebar-collapsed";
 type AppSection = "project" | "people" | "inbox" | "settings";
 
 const viewOptions: { id: ViewMode; label: string; icon: typeof List }[] = [
@@ -130,7 +137,7 @@ function StatusIcon({ status }: { status: TaskStatus }) {
 }
 
 export function ProjectApp() {
-  const [data, setData] = useState<WorkspaceData>(seedData);
+  const [data, setData] = useState<WorkspaceData>(() => ({ ...seedData, tasks: migrateLegacySubtasks(seedData.tasks) }));
   const [loaded, setLoaded] = useState(false);
   const [activeProjectId, setActiveProjectId] = useState("p1");
   const [view, setView] = useState<ViewMode>("overview");
@@ -143,6 +150,7 @@ export function ProjectApp() {
   const [inviteModalOpen, setInviteModalOpen] = useState(false);
   const [notificationsOpen, setNotificationsOpen] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [toast, setToast] = useState("");
   const [myTasksOnly, setMyTasksOnly] = useState(false);
   const [section, setSection] = useState<AppSection>("project");
@@ -159,6 +167,10 @@ export function ProjectApp() {
   const syncQueueRef = useRef(Promise.resolve());
 
   useEffect(() => {
+    setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_KEY) === "true");
+  }, []);
+
+  useEffect(() => {
     void enableFirebaseAnalytics();
     void enableFirebaseAppCheck().catch((error: unknown) => {
       setCloudError(`Firebase App Check could not start: ${error instanceof Error ? error.message : "Unknown error"}`);
@@ -169,7 +181,7 @@ export function ProjectApp() {
         const saved = window.localStorage.getItem(STORAGE_KEY);
         if (saved) {
           const parsed = JSON.parse(saved) as WorkspaceData;
-          setData({ ...parsed, milestones: parsed.milestones ?? [], savedViews: parsed.savedViews ?? [], customTemplates: parsed.customTemplates ?? [], tasks: parsed.tasks.map((task) => ({ ...task, subtasks: task.subtasks ?? [], commentItems: task.commentItems ?? [], attachmentItems: task.attachmentItems ?? [], activity: task.activity ?? [], dependencyIds: task.dependencyIds ?? (task.dependencyId ? [task.dependencyId] : []) })), settings: { ...seedData.settings!, ...parsed.settings } });
+          setData({ ...parsed, milestones: parsed.milestones ?? [], savedViews: parsed.savedViews ?? [], customTemplates: parsed.customTemplates ?? [], tasks: migrateLegacySubtasks(parsed.tasks), settings: { ...seedData.settings!, ...parsed.settings } });
         }
       } catch {
         // A malformed local demo record should never prevent the workspace from loading.
@@ -206,7 +218,7 @@ export function ProjectApp() {
             return;
           }
           lastCloudDataRef.current = cloudData;
-          setData(cloudData);
+          setData({ ...cloudData, tasks: migrateLegacySubtasks(cloudData.tasks) });
           setDataMode("firestore");
           setLoaded(true);
           setCloudError("");
@@ -258,7 +270,7 @@ export function ProjectApp() {
           const cloudData = queuedCloudDataRef.current;
           queuedCloudDataRef.current = null;
           lastCloudDataRef.current = cloudData;
-          setData(cloudData);
+          setData({ ...cloudData, tasks: migrateLegacySubtasks(cloudData.tasks) });
         }
       });
   }, [currentUserId, data, dataMode, loaded]);
@@ -272,9 +284,9 @@ export function ProjectApp() {
   const activeProject = data.projects.find((project) => project.id === activeProjectId) ?? data.projects[0];
   const projectTasks = data.tasks.filter((task) => task.projectId === activeProject?.id);
   const visibleTasks = useMemo(() => {
-    const base = myTasksOnly ? projectTasks.filter((task) => task.assigneeId === currentUserId) : projectTasks;
+    const base = myTasksOnly ? data.tasks.filter((task) => task.assigneeId === currentUserId) : projectTasks;
     return filterTasks(base, query, assigneeFilter, priorityFilter);
-  }, [projectTasks, query, assigneeFilter, priorityFilter, myTasksOnly, currentUserId]);
+  }, [data.tasks, projectTasks, query, assigneeFilter, priorityFilter, myTasksOnly, currentUserId]);
   const selectedTask = data.tasks.find((task) => task.id === selectedTaskId) ?? null;
   const unreadCount = data.notifications.filter((notification) => !notification.read).length;
   const currentMember = data.members.find((member) => member.id === currentUserId) ?? data.members[0];
@@ -287,6 +299,14 @@ export function ProjectApp() {
     setProfileMenuOpen(false);
   }
 
+  function toggleDesktopSidebar() {
+    setSidebarCollapsed((current) => {
+      const next = !current;
+      window.localStorage.setItem(SIDEBAR_KEY, String(next));
+      return next;
+    });
+  }
+
   async function handleSignOut() {
     const auth = getFirebaseAuth();
     if (auth?.currentUser) await signOut(auth);
@@ -294,7 +314,11 @@ export function ProjectApp() {
   }
 
   function saveProject(project: Project, tasks: Task[]) {
-    setData((current) => ({ ...current, projects: [...current.projects, project], tasks: [...current.tasks, ...tasks.map((task) => ({ ...task, activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created" as const, summary: `created ${task.title}`, createdAt: new Date().toISOString() }] }))] }));
+    setData((current) => {
+      const timestamp = new Date().toISOString();
+      const additions = migrateLegacySubtasks(tasks.map((task) => ({ ...task, durationDays: taskDuration(task), activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created" as const, summary: `created ${task.title}`, createdAt: timestamp }] })));
+      return { ...current, projects: [...current.projects, project], tasks: recalculateProjectSchedule([...current.tasks, ...additions], project) };
+    });
     setActiveProjectId(project.id);
     setView(data.settings?.defaultView ?? "overview");
     setSection("project");
@@ -310,7 +334,7 @@ export function ProjectApp() {
       const statusChanged = patch.status && patch.status !== existing.status;
       const event = statusChanged ? { id: uid("activity"), actorId: currentUserId, kind: patch.status === "Complete" ? "completed" as const : "updated" as const, summary: patch.status === "Complete" ? `completed ${existing.title}` : `moved ${existing.title} to ${patch.status}`, createdAt: timestamp } : null;
       const requestedActivity = patch.activity ?? existing.activity ?? [];
-      const updated: Task = { ...existing, ...patch, activity: event ? [...requestedActivity, event] : requestedActivity, updatedAt: timestamp };
+      const updated: Task = { ...existing, ...patch, durationDays: patch.dueDate && patch.durationDays === undefined ? inclusiveDuration(patch.startDate ?? existing.startDate, patch.dueDate) : Math.max(1, Math.floor(patch.durationDays ?? taskDuration(existing))), activity: event ? [...requestedActivity, event] : requestedActivity, updatedAt: timestamp };
       let tasks = current.tasks.map((task) => task.id === taskId ? updated : task);
       const recurrence = updated.recurrence ?? (updated.recurring ? { frequency: "monthly" as const, interval: 1 } : undefined);
       if (patch.status === "Complete" && existing.status !== "Complete" && recurrence && !existing.recurrenceGeneratedAt) {
@@ -319,8 +343,32 @@ export function ProjectApp() {
         tasks = tasks.map((task) => task.id === taskId ? { ...task, recurrenceGeneratedAt: timestamp } : task);
         tasks.push({ ...updated, id: `rec-${updated.id}-${nextDueDate}`, status: "Not Started", startDate: nextStartDate, dueDate: nextDueDate, subtasks: updated.subtasks.map((subtask) => ({ ...subtask, id: uid("sub"), complete: false })), comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created", summary: `created the next recurring ${updated.title}`, createdAt: timestamp }], recurrenceGeneratedAt: undefined, createdAt: timestamp, updatedAt: timestamp });
       }
-      return { ...current, tasks };
+      const project = current.projects.find((item) => item.id === existing.projectId);
+      return { ...current, tasks: project ? recalculateProjectSchedule(tasks, project) : tasks };
     });
+  }
+
+  function addChildTask(parentTaskId: string, title: string) {
+    setData((current) => {
+      const parent = current.tasks.find((task) => task.id === parentTaskId);
+      const project = parent ? current.projects.find((item) => item.id === parent.projectId) : undefined;
+      if (!parent || !project) return current;
+      const timestamp = new Date().toISOString();
+      const child: Task = { id: uid("task"), projectId: parent.projectId, parentTaskId, title, description: "", status: "Not Started", priority: parent.priority, assigneeId: parent.assigneeId, startDate: parent.startDate, dueDate: parent.startDate, durationDays: 1, estimate: 0, labels: [], subtasks: [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created", summary: `created child task ${title}`, createdAt: timestamp }], dependencyIds: [], createdAt: timestamp, updatedAt: timestamp };
+      return { ...current, tasks: recalculateProjectSchedule([...current.tasks, child], project) };
+    });
+    setToast("Child task added");
+  }
+
+  function addScheduleTask(parentTaskId?: string) {
+    if (parentTaskId) {
+      addChildTask(parentTaskId, "New child task");
+      return;
+    }
+    const timestamp = new Date().toISOString();
+    const task: Task = { id: uid("task"), projectId: activeProject.id, title: "New task", description: "", status: "Not Started", priority: "Medium", assigneeId: currentUserId, startDate: activeProject.startDate, dueDate: activeProject.startDate, durationDays: 1, estimate: 0, labels: [], subtasks: [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created", summary: "created New task", createdAt: timestamp }], dependencyIds: [], createdAt: timestamp, updatedAt: timestamp };
+    setData((current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) }));
+    setToast("Task row added");
   }
 
   function addComment(taskId: string, body: string) {
@@ -399,19 +447,48 @@ export function ProjectApp() {
   }
 
   function bulkUpdate(taskIds: string[], patch: Partial<Task>) {
-    setData((current) => ({ ...current, tasks: current.tasks.map((task) => taskIds.includes(task.id) ? { ...task, ...patch, updatedAt: new Date().toISOString() } : task) }));
+    setData((current) => {
+      const timestamp = new Date().toISOString();
+      let tasks = current.tasks.map((task) => taskIds.includes(task.id) ? { ...task, ...patch, durationDays: patch.durationDays ?? taskDuration(task), updatedAt: timestamp } : task);
+      const projectIds = [...new Set(tasks.filter((task) => taskIds.includes(task.id)).map((task) => task.projectId))];
+      for (const projectId of projectIds) {
+        const project = current.projects.find((item) => item.id === projectId);
+        if (project) tasks = recalculateProjectSchedule(tasks, project);
+      }
+      return { ...current, tasks };
+    });
     setToast(`${taskIds.length} task${taskIds.length === 1 ? "" : "s"} updated`);
   }
 
   function bulkDelete(taskIds: string[]) {
     if (!window.confirm(`Delete ${taskIds.length} selected task${taskIds.length === 1 ? "" : "s"}?`)) return;
-    setData((current) => ({ ...current, tasks: current.tasks.filter((task) => !taskIds.includes(task.id)) }));
+    setData((current) => {
+      const removed = new Set(taskIds);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const task of current.tasks) if (task.parentTaskId && removed.has(task.parentTaskId) && !removed.has(task.id)) { removed.add(task.id); changed = true; }
+      }
+      let tasks: Task[] = current.tasks.filter((task) => !removed.has(task.id)).map((task) => ({ ...task, dependencyIds: (task.dependencyIds ?? []).filter((id) => !removed.has(id)) }));
+      for (const project of current.projects) tasks = recalculateProjectSchedule(tasks, project);
+      return { ...current, tasks };
+    });
     setToast("Selected tasks deleted");
   }
 
   function deleteTask(taskId: string) {
     if (!window.confirm("Delete this task? This can’t be undone.")) return;
-    setData((current) => ({ ...current, tasks: current.tasks.filter((task) => task.id !== taskId) }));
+    setData((current) => {
+      const removed = new Set([taskId]);
+      let changed = true;
+      while (changed) {
+        changed = false;
+        for (const task of current.tasks) if (task.parentTaskId && removed.has(task.parentTaskId) && !removed.has(task.id)) { removed.add(task.id); changed = true; }
+      }
+      let tasks: Task[] = current.tasks.filter((task) => !removed.has(task.id)).map((task) => ({ ...task, dependencyIds: (task.dependencyIds ?? []).filter((id) => !removed.has(id)) }));
+      for (const project of current.projects) tasks = recalculateProjectSchedule(tasks, project);
+      return { ...current, tasks };
+    });
     setSelectedTaskId(null);
     setToast("Task deleted");
   }
@@ -420,8 +497,18 @@ export function ProjectApp() {
     if (!activeProject) return;
     const projectId = uid("project");
     const copy: Project = { ...activeProject, id: projectId, name: `${activeProject.name} copy`, status: "Planning" };
-    const copies = projectTasks.map((task) => ({ ...task, id: uid("task"), projectId, status: "Not Started" as TaskStatus }));
-    setData((current) => ({ ...current, projects: [...current.projects, copy], tasks: [...current.tasks, ...copies] }));
+    const taskIds = new Map(projectTasks.map((task) => [task.id, uid("task")]));
+    const copies: Task[] = projectTasks.map((task) => ({
+      ...task,
+      id: taskIds.get(task.id)!,
+      projectId,
+      parentTaskId: task.parentTaskId ? taskIds.get(task.parentTaskId) : undefined,
+      dependencyIds: (task.dependencyIds ?? []).map((id) => taskIds.get(id)).filter((id): id is string => Boolean(id)),
+      dependencyId: undefined,
+      status: "Not Started",
+      recurrenceGeneratedAt: undefined,
+    }));
+    setData((current) => ({ ...current, projects: [...current.projects, copy], tasks: [...current.tasks, ...recalculateProjectSchedule(copies, copy)] }));
     setActiveProjectId(projectId);
     setToast("Project duplicated");
   }
@@ -435,8 +522,22 @@ export function ProjectApp() {
   }
 
   function exportCsv() {
-    const header = ["Task", "Status", "Priority", "Assignee", "Start", "Due", "Estimate"];
-    const rows = visibleTasks.map((task) => [task.title, task.status, task.priority, data.members.find((member) => member.id === task.assigneeId)?.name ?? "", task.startDate, task.dueDate, task.estimate]);
+    const outlined = taskOutline(visibleTasks);
+    const rowNumbers = new Map(outlined.map((row) => [row.task.id, row.outline]));
+    const header = ["WBS", "Task", "Parent", "Predecessors", "Duration (days)", "Start", "Finish", "Status", "Priority", "Assignee", "Estimate (hours)"];
+    const rows = outlined.map(({ task, outline }) => [
+      outline,
+      task.title,
+      task.parentTaskId ? rowNumbers.get(task.parentTaskId) ?? task.parentTaskId : "",
+      (task.dependencyIds ?? []).map((id) => rowNumbers.get(id) ?? id).join(", "),
+      taskDuration(task),
+      task.startDate,
+      task.dueDate,
+      task.status,
+      task.priority,
+      data.members.find((member) => member.id === task.assigneeId)?.name ?? "",
+      task.estimate,
+    ]);
     const csv = [header, ...rows].map((row) => row.map((value) => `"${String(value).replaceAll('"', '""')}"`).join(",")).join("\n");
     const link = document.createElement("a");
     link.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
@@ -483,11 +584,12 @@ export function ProjectApp() {
   if (!activeProject) return <><main className="workspace-loading"><span className="brand-mark"><Sparkles size={19} /></span><strong>Welcome to Orbit</strong><small>Let’s set up your first project.</small></main><ProjectModal data={data} onboarding close={() => undefined} save={saveProject} /></>;
 
   return (
-    <div className="app-shell">
-      {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close navigation" onClick={() => setSidebarOpen(false)} />}
-      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""}`}>
+    <div className={`app-shell ${sidebarCollapsed ? "sidebar-is-collapsed" : ""}`}>
+      {sidebarOpen && <button className="sidebar-backdrop" aria-label="Close navigation backdrop" onClick={() => setSidebarOpen(false)} />}
+      <aside className={`sidebar ${sidebarOpen ? "sidebar-open" : ""} ${sidebarCollapsed ? "sidebar-collapsed" : ""}`}>
         <div className="sidebar-top">
           <a className="brand" href="#"><span className="brand-mark"><Sparkles size={16} /></span><span>orbit</span></a>
+          <button className="icon-button sidebar-collapse-control" onClick={toggleDesktopSidebar} aria-label="Close sidebar"><PanelLeftClose size={18} /></button>
           <button className="icon-button mobile-close" onClick={() => setSidebarOpen(false)} aria-label="Close navigation"><X size={18} /></button>
         </div>
         <button className="workspace-switcher">
@@ -522,8 +624,9 @@ export function ProjectApp() {
         </div>
       </aside>
 
-      <main className="main-content">
+      <main className={`main-content ${sidebarCollapsed ? "sidebar-collapsed-content" : ""}`}>
         <header className="topbar">
+          {sidebarCollapsed && <button className="icon-button desktop-sidebar-open" onClick={toggleDesktopSidebar} aria-label="Open sidebar"><PanelLeftOpen size={19} /></button>}
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation"><Menu size={19} /></button>
           <label className="global-search"><Search size={16} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="Search tasks, projects, or people…" /><span><Command size={11} /> K</span></label>
           <div className="topbar-actions">
@@ -537,7 +640,7 @@ export function ProjectApp() {
             <span className="project-icon-large" style={{ background: activeProject.color }}>{activeProject.icon}</span>
             <div className="project-heading">
               <div><h1>{myTasksOnly ? "My tasks" : activeProject.name}</h1><button className="bare-button"><ChevronDown size={17} /></button></div>
-              <p>{myTasksOnly ? `Your open work in ${activeProject.name}` : activeProject.description}</p>
+              <p>{myTasksOnly ? "Your assigned work across every project" : activeProject.description}</p>
             </div>
             <div className="project-actions">
               <div className="avatar-stack">{activeProject.memberIds.slice(0, 4).map((id) => <Avatar key={id} member={data.members.find((member) => member.id === id)} small />)}</div>
@@ -555,8 +658,9 @@ export function ProjectApp() {
               })}
             </div>
             <div className="filter-actions">
-              <label className={(data.savedViews ?? []).length ? "filter-active" : ""}><Save size={14} /><select aria-label="Saved views" defaultValue="" onChange={(event) => { if (event.target.value) applySavedView(event.target.value); event.target.value = ""; }}><option value="">Saved views</option>{(data.savedViews ?? []).filter((item) => item.projectId === activeProject.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={12} /></label>
-              <button className="save-view-button" onClick={saveCurrentView}><Plus size={13} /> Save view</button>
+              <label className={(data.savedViews ?? []).length ? "filter-active" : ""}><Save size={14} /><select aria-label="Open a saved view" defaultValue="" onChange={(event) => { if (event.target.value) applySavedView(event.target.value); event.target.value = ""; }}><option value="">Open saved view</option>{(data.savedViews ?? []).filter((item) => item.projectId === activeProject.id).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}</select><ChevronDown size={12} /></label>
+              <button className="save-view-button" onClick={saveCurrentView}><Plus size={13} /> Save current view</button>
+              <details className="saved-view-help"><summary aria-label="What are saved views?">?</summary><p>A saved view remembers this project’s layout, search, assignee filter, and priority filter so you can reopen the same working setup in one click.</p></details>
               <label className={assigneeFilter ? "filter-active" : ""}><Users size={14} /><select value={assigneeFilter} onChange={(event) => setAssigneeFilter(event.target.value)}><option value="">Assignee</option>{data.members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select><ChevronDown size={12} /></label>
               <label className={priorityFilter ? "filter-active" : ""}><Filter size={14} /><select value={priorityFilter} onChange={(event) => setPriorityFilter(event.target.value)}><option value="">Priority</option>{PRIORITIES.map((priority) => <option key={priority}>{priority}</option>)}</select><ChevronDown size={12} /></label>
               {(assigneeFilter || priorityFilter || query) && <button className="clear-filter" onClick={() => { setQuery(""); setAssigneeFilter(""); setPriorityFilter(""); }}>Clear</button>}
@@ -569,8 +673,8 @@ export function ProjectApp() {
           {section === "project" && view === "list" && <ListView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
           {section === "project" && view === "board" && <BoardView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
           {section === "project" && view === "timeline" && <TimelineView data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} />}
-          {section === "project" && view === "table" && <BulkTableView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} exportCsv={exportCsv} />}
-          {section === "project" && view === "calendar" && <CalendarView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} />}
+          {section === "project" && view === "table" && <ScheduleTable data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} onAddTask={addScheduleTask} exportCsv={exportCsv} />}
+          {section === "project" && view === "calendar" && <ProjectCalendar data={data} tasks={visibleTasks} onTask={setSelectedTaskId} />}
           {section === "people" && <PeopleManagementView data={data} invitations={invitations} invite={() => setInviteModalOpen(true)} resend={(invitation) => void resendInvitation(invitation)} revoke={(invitation) => void revokeInvitation(invitation)} updateRole={(memberId, role) => setData((current) => ({ ...current, members: current.members.map((member) => member.id === memberId ? { ...member, role } : member) }))} />}
           {section === "inbox" && <InboxView data={data} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} markOne={(id) => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => notification.id === id ? { ...notification, read: true } : notification) }))} openSettings={() => openSection("settings")} />}
           {section === "settings" && <SettingsView data={data} currentUserId={currentUserId} dataMode={dataMode} update={(patch) => setData((current) => ({ ...current, ...patch }))} notify={setToast} />}
@@ -579,10 +683,11 @@ export function ProjectApp() {
 
       {notificationsOpen && <NotificationPanel data={data} close={() => setNotificationsOpen(false)} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openInbox={() => openSection("inbox")} openSettings={() => openSection("settings")} />}
       {profileMenuOpen && <ProfileMenu member={currentMember} firebaseConnected={dataMode === "firestore"} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} switchAccount={() => { window.location.href = "/sign-in?switch=1"; }} signOut={() => void handleSignOut()} />}
-      {selectedTask && <AdvancedTaskDrawer data={data} task={selectedTask} currentUserId={currentUserId} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} />}
-      {taskModalOpen && <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={(task) => { setData((current) => ({ ...current, tasks: [...current.tasks, task] })); setTaskModalOpen(false); setToast("Task created"); }} />}
+      {selectedTask && <TaskDetailDrawer data={data} task={selectedTask} currentUserId={currentUserId} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} addChild={addChildTask} openTask={setSelectedTaskId} />}
+      {taskModalOpen && <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={(task) => { setData((current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) })); setTaskModalOpen(false); setToast("Task created"); }} />}
       {projectModalOpen && <ProjectModal data={data} close={() => setProjectModalOpen(false)} save={saveProject} />}
       {inviteModalOpen && <InviteModal dataMode={dataMode} close={() => setInviteModalOpen(false)} save={inviteTeammate} />}
+      <nav className="mobile-bottom-nav" aria-label="Mobile navigation"><button className={section === "project" && !myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(false); setView("overview"); }}><LayoutDashboard size={18} /><span>Home</span></button><button className={myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(true); setView("list"); }}><CheckCircle2 size={18} /><span>My tasks</span></button><button className={section === "inbox" ? "active" : ""} onClick={() => openSection("inbox")}><Inbox size={18} /><span>Inbox</span></button><button onClick={() => setTaskModalOpen(true)}><Plus size={19} /><span>New</span></button></nav>
       {toast && <div className="toast"><Check size={16} />{toast}</div>}
     </div>
   );
@@ -738,6 +843,7 @@ function TimelineView({ data, project, tasks, onTask }: { data: WorkspaceData; p
   return <div className="timeline-view panel"><div className="timeline-header"><div className="timeline-task-col">Task</div><div className="timeline-weeks">{weeks.map((week) => <span key={week}>{week}</span>)}</div></div>{tasks.map((task) => { const left = Math.max(0, ((new Date(`${task.startDate}T12:00:00`).getTime() - projectStart) / span) * 100); const width = Math.max(5, ((new Date(`${task.dueDate}T12:00:00`).getTime() - new Date(`${task.startDate}T12:00:00`).getTime()) / span) * 100); return <button className="timeline-row" key={task.id} onClick={() => onTask(task.id)}><span className="timeline-task-col"><StatusIcon status={task.status} /><span><strong>{task.title}</strong><small>{data.members.find((member) => member.id === task.assigneeId)?.name}</small></span></span><span className="timeline-track"><i className={statusTone[task.status]} style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}><b>{task.estimate}h</b></i></span></button>; })}<div className="timeline-today" style={{ left: `calc(260px + ${Math.max(0, Math.min(100, ((Date.now() - projectStart) / span) * 100))}% * (100% - 260px) / 100)` }}><span>Today</span></div></div>;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function BulkTableView({ data, tasks, onTask, onTaskUpdate, onBulkUpdate, onBulkDelete, exportCsv }: { data: WorkspaceData; tasks: Task[]; onTask: (id: string) => void; onTaskUpdate: (id: string, patch: Partial<Task>) => void; onBulkUpdate: (ids: string[], patch: Partial<Task>) => void; onBulkDelete: (ids: string[]) => void; exportCsv: () => void }) {
   const [selected, setSelected] = useState<string[]>([]);
   useEffect(() => setSelected((current) => current.filter((id) => tasks.some((task) => task.id === id))), [tasks]);
@@ -750,6 +856,7 @@ function TableView({ data, tasks, onTask, onTaskUpdate, exportCsv }: { data: Wor
   return <div className="table-panel panel"><div className="table-tools"><span>{tasks.length} tasks</span><button onClick={exportCsv}><Download size={14} /> Export CSV</button></div><div className="data-table-wrap"><table className="data-table"><thead><tr><th><input type="checkbox" aria-label="Select all" /></th><th>Task</th><th>Status</th><th>Assignee</th><th>Priority</th><th>Start</th><th>Due</th><th>Estimate</th><th /></tr></thead><tbody>{tasks.map((task) => <tr key={task.id}><td><input type="checkbox" aria-label={`Select ${task.title}`} /></td><td><button onClick={() => onTask(task.id)}><strong>{task.title}</strong><small>{task.labels.join(" · ")}</small></button></td><td><select className={`table-select ${statusTone[task.status]}`} value={task.status} onChange={(event) => onTaskUpdate(task.id, { status: event.target.value as TaskStatus })}>{TASK_STATUSES.map((status) => <option key={status}>{status}</option>)}</select></td><td><span className="table-person"><Avatar member={data.members.find((member) => member.id === task.assigneeId)} small />{data.members.find((member) => member.id === task.assigneeId)?.name}</span></td><td><select className={`table-select ${priorityTone[task.priority]}`} value={task.priority} onChange={(event) => onTaskUpdate(task.id, { priority: event.target.value as Priority })}>{PRIORITIES.map((priority) => <option key={priority}>{priority}</option>)}</select></td><td><input type="date" value={task.startDate} onChange={(event) => onTaskUpdate(task.id, { startDate: event.target.value })} /></td><td><input type="date" className={isOverdue(task) ? "overdue-input" : ""} value={task.dueDate} onChange={(event) => onTaskUpdate(task.id, { dueDate: event.target.value })} /></td><td>{task.estimate}h</td><td><button><MoreHorizontal size={16} /></button></td></tr>)}</tbody></table></div></div>;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function CalendarView({ data, tasks, onTask }: { data: WorkspaceData; tasks: Task[]; onTask: (id: string) => void }) {
   const now = new Date();
   const year = now.getFullYear();
@@ -764,6 +871,7 @@ function NotificationPanel({ data, close, markAll, openInbox, openSettings }: { 
   return <div className="notification-panel panel"><header><div><h2>Notifications</h2><span>{data.notifications.filter((item) => !item.read).length} new</span></div><button className="icon-button" onClick={close}><X size={17} /></button></header><button className="mark-read" onClick={markAll}><Check size={14} /> Mark all as read</button><div className="notification-list">{data.notifications.map((notification) => <button key={notification.id} className={!notification.read ? "unread" : ""}><span className={`notification-icon ${notification.tone}`}><Bell size={15} /></span><span><strong>{notification.title}</strong><p>{notification.body}</p><small>{notification.time}</small></span>{!notification.read && <i />}</button>)}</div><footer><button onClick={openInbox}>Open inbox <ArrowRight size={14} /></button><button onClick={openSettings}>Settings</button></footer></div>;
 }
 
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
 function AdvancedTaskDrawer({ data, task, currentUserId, close, update, remove, addComment, uploadAttachment, removeAttachment }: { data: WorkspaceData; task: Task; currentUserId: string; close: () => void; update: (id: string, patch: Partial<Task>) => void; remove: (id: string) => void; addComment: (id: string, body: string) => void; uploadAttachment: (id: string, file: File) => Promise<void>; removeAttachment: (id: string, attachment: TaskAttachment) => Promise<void> }) {
   const [comment, setComment] = useState("");
   const [newSubtask, setNewSubtask] = useState("");
@@ -800,7 +908,7 @@ function ModalShell({ title, subtitle, close, children, className = "", dismissi
 
 function TaskModal({ data, projectId, close, save }: { data: WorkspaceData; projectId: string; close: () => void; save: (task: Task) => void }) {
   const [title, setTitle] = useState(""); const [description, setDescription] = useState(""); const [status, setStatus] = useState<TaskStatus>("Not Started"); const [priority, setPriority] = useState<Priority>("Medium"); const [assignee, setAssignee] = useState(data.members[0].id); const [dueDate, setDueDate] = useState(today(7)); const [estimate, setEstimate] = useState(2); const [recurrence, setRecurrence] = useState<"" | "daily" | "weekly" | "monthly">("");
-  function submit(event: FormEvent) { event.preventDefault(); const timestamp = new Date().toISOString(); save({ id: uid("task"), projectId, title: title.trim(), description: description.trim(), status, priority, assigneeId: assignee, startDate: today(), dueDate, estimate, labels: [], subtasks: [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [], recurring: Boolean(recurrence), recurrence: recurrence ? { frequency: recurrence, interval: 1 } : undefined, createdAt: timestamp, updatedAt: timestamp }); }
+  function submit(event: FormEvent) { event.preventDefault(); const timestamp = new Date().toISOString(); save({ id: uid("task"), projectId, title: title.trim(), description: description.trim(), status, priority, assigneeId: assignee, startDate: today(), dueDate, durationDays: inclusiveDuration(today(), dueDate), estimate, labels: [], subtasks: [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [], recurring: Boolean(recurrence), recurrence: recurrence ? { frequency: recurrence, interval: 1 } : undefined, createdAt: timestamp, updatedAt: timestamp }); }
   return <ModalShell title="Create a new task" subtitle="Add the essentials now—you can fill in details later." close={close}><form className="modal-form" onSubmit={submit}><label className="wide">Task name<input autoFocus value={title} onChange={(event) => setTitle(event.target.value)} placeholder="What needs to get done?" required /></label><label className="wide">Description<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="Add context, a goal, or acceptance criteria…" rows={3} /></label><div className="form-grid"><label>Status<select value={status} onChange={(event) => setStatus(event.target.value as TaskStatus)}>{TASK_STATUSES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Priority<select value={priority} onChange={(event) => setPriority(event.target.value as Priority)}>{PRIORITIES.map((item) => <option key={item}>{item}</option>)}</select></label><label>Assignee<select value={assignee} onChange={(event) => setAssignee(event.target.value)}>{data.members.map((member) => <option key={member.id} value={member.id}>{member.name}</option>)}</select></label><label>Due date<input type="date" value={dueDate} onChange={(event) => setDueDate(event.target.value)} required /></label><label>Estimate (hours)<input type="number" min="0" max="999" value={estimate} onChange={(event) => setEstimate(Number(event.target.value))} /></label><label>Repeats<select value={recurrence} onChange={(event) => setRecurrence(event.target.value as typeof recurrence)}><option value="">Does not repeat</option><option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option></select></label></div><footer><button type="button" className="secondary-button" onClick={close}>Cancel</button><button className="primary-button" type="submit"><Plus size={16} /> Create task</button></footer></form></ModalShell>;
 }
 
@@ -877,7 +985,7 @@ function ProjectModal({ data, close, save, onboarding = false }: { data: Workspa
     const projectId = uid("project");
     const timestamp = new Date().toISOString();
     const project: Project = { id: projectId, name: name.trim(), description: description.trim() || "A new team project.", icon: name.trim().charAt(0).toUpperCase(), color, status: "Planning", startDate: today(), dueDate, ownerId: data.members[0].id, memberIds: [data.members[0].id] };
-    const tasks: Task[] = drafts.map((draft) => ({ ...draft, id: uid("task"), projectId, title: draft.title.trim(), subtasks: draft.subtasks ?? [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [], createdAt: timestamp, updatedAt: timestamp }));
+    const tasks: Task[] = drafts.map((draft) => ({ ...draft, id: uid("task"), projectId, title: draft.title.trim(), durationDays: inclusiveDuration(draft.startDate, draft.dueDate), subtasks: draft.subtasks ?? [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [], createdAt: timestamp, updatedAt: timestamp }));
     save(project, tasks);
   }
 
