@@ -102,6 +102,54 @@ export function migrateLegacySubtasks(tasks: Task[]) {
   return migrated;
 }
 
+export function duplicateTaskTree(
+  tasks: Task[],
+  rootTaskId: string,
+  createId: (originalId: string) => string,
+  timestamp: string,
+  actorId: string,
+) {
+  const root = tasks.find((task) => task.id === rootTaskId);
+  if (!root) return [];
+
+  const included = new Set([rootTaskId]);
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (const task of tasks) {
+      if (task.parentTaskId && included.has(task.parentTaskId) && !included.has(task.id)) {
+        included.add(task.id);
+        changed = true;
+      }
+    }
+  }
+
+  const tree = tasks.filter((task) => included.has(task.id));
+  const ids = new Map(tree.map((task) => [task.id, createId(task.id)]));
+  return tree.map((task): Task => {
+    const dependencyIds = (task.dependencyIds ?? (task.dependencyId ? [task.dependencyId] : []))
+      .map((id) => ids.get(id) ?? id);
+    return {
+      ...task,
+      id: ids.get(task.id)!,
+      title: task.id === rootTaskId ? `${task.title} copy` : task.title,
+      parentTaskId: task.parentTaskId ? ids.get(task.parentTaskId) ?? task.parentTaskId : undefined,
+      dependencyIds,
+      dependencyId: undefined,
+      status: "Not Started",
+      subtasks: [],
+      comments: 0,
+      attachments: 0,
+      commentItems: [],
+      attachmentItems: [],
+      activity: [{ id: `activity-${ids.get(task.id)}`, actorId, kind: "created", summary: `duplicated ${task.title}`, createdAt: timestamp }],
+      recurrenceGeneratedAt: undefined,
+      createdAt: timestamp,
+      updatedAt: timestamp,
+    };
+  });
+}
+
 function summaryStatus(children: Task[]): TaskStatus {
   if (children.every((task) => task.status === "Complete")) return "Complete";
   if (children.some((task) => task.status === "Blocked")) return "Blocked";
@@ -133,7 +181,8 @@ export function recalculateProjectSchedule(tasks: Task[], project: Project) {
       if (!children.length) continue;
       const startDate = children.map((task) => task.startDate).sort()[0];
       const dueDate = children.map((task) => task.dueDate).sort().at(-1)!;
-      scheduled.set(id, { ...parent, startDate, dueDate, durationDays: inclusiveDuration(startDate, dueDate), status: summaryStatus(children) });
+      const durationDays = children.reduce((total, child) => total + taskDuration(child), 0);
+      scheduled.set(id, { ...parent, startDate, dueDate, durationDays, status: summaryStatus(children) });
     }
   }
 

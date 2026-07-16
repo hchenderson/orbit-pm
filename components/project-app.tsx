@@ -64,7 +64,7 @@ import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage
 import { ensureUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
 import { createWorkspaceInvitation, resendWorkspaceInvitation, revokeWorkspaceInvitation, subscribeToWorkspaceInvitations } from "@/lib/invitations";
 import { dateLabel, daysUntil, filterTasks, isDueToday, isOverdue, PRIORITIES, taskProgress, TASK_STATUSES } from "@/lib/task-utils";
-import { inclusiveDuration, migrateLegacySubtasks, recalculateProjectSchedule, taskDuration, taskOutline } from "@/lib/scheduling";
+import { duplicateTaskTree, inclusiveDuration, migrateLegacySubtasks, recalculateProjectSchedule, taskDuration, taskOutline } from "@/lib/scheduling";
 import type { CustomTemplate, Member, Priority, Project, Role, SavedView, Task, TaskAttachment, TaskComment, TaskStatus, ViewMode, WorkspaceData, WorkspaceInvitation } from "@/lib/types";
 
 const STORAGE_KEY = "orbit-workspace-v1";
@@ -493,6 +493,20 @@ export function ProjectApp() {
     setToast("Task deleted");
   }
 
+  function duplicateTask(taskId: string) {
+    const duplicatedRootId = uid("task");
+    setData((current) => {
+      const original = current.tasks.find((task) => task.id === taskId);
+      const project = original ? current.projects.find((item) => item.id === original.projectId) : undefined;
+      if (!original || !project) return current;
+      const timestamp = new Date().toISOString();
+      const copies = duplicateTaskTree(current.tasks, taskId, (originalId) => originalId === taskId ? duplicatedRootId : uid("task"), timestamp, currentUserId);
+      return { ...current, tasks: recalculateProjectSchedule([...current.tasks, ...copies], project) };
+    });
+    setSelectedTaskId(duplicatedRootId);
+    setToast("Task and child tasks duplicated");
+  }
+
   function duplicateProject() {
     if (!activeProject) return;
     const projectId = uid("project");
@@ -683,7 +697,7 @@ export function ProjectApp() {
 
       {notificationsOpen && <NotificationPanel data={data} close={() => setNotificationsOpen(false)} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openInbox={() => openSection("inbox")} openSettings={() => openSection("settings")} />}
       {profileMenuOpen && <ProfileMenu member={currentMember} firebaseConnected={dataMode === "firestore"} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} switchAccount={() => { window.location.href = "/sign-in?switch=1"; }} signOut={() => void handleSignOut()} />}
-      {selectedTask && <TaskDetailDrawer data={data} task={selectedTask} currentUserId={currentUserId} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} addChild={addChildTask} openTask={setSelectedTaskId} />}
+      {selectedTask && <TaskDetailDrawer data={data} task={selectedTask} currentUserId={currentUserId} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} duplicate={duplicateTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} addChild={addChildTask} openTask={setSelectedTaskId} />}
       {taskModalOpen && <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={(task) => { setData((current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) })); setTaskModalOpen(false); setToast("Task created"); }} />}
       {projectModalOpen && <ProjectModal data={data} close={() => setProjectModalOpen(false)} save={saveProject} />}
       {inviteModalOpen && <InviteModal dataMode={dataMode} close={() => setInviteModalOpen(false)} save={inviteTeammate} />}

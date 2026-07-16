@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { migrateLegacySubtasks, recalculateProjectSchedule, taskOutline, wouldCreateDependencyCycle, wouldCreateParentCycle } from "../lib/scheduling";
+import { duplicateTaskTree, migrateLegacySubtasks, recalculateProjectSchedule, taskOutline, wouldCreateDependencyCycle, wouldCreateParentCycle } from "../lib/scheduling";
 import type { Project, Task } from "../lib/types";
 
 const project: Project = { id: "p1", name: "Plan", description: "", icon: "P", color: "#000", status: "Active", startDate: "2026-08-01", dueDate: "2026-09-01", ownerId: "m1", memberIds: ["m1"] };
@@ -16,7 +16,7 @@ describe("calculated project scheduling", () => {
     expect(scheduled.find((item) => item.id === "b")?.dueDate).toBe("2026-08-05");
   });
 
-  it("rolls parent dates and status up from child tasks", () => {
+  it("rolls parent dates, duration, and status up from child tasks", () => {
     const scheduled = recalculateProjectSchedule([
       task("parent"),
       { ...task("child-1", "2026-08-02"), parentTaskId: "parent", durationDays: 2, status: "Complete" },
@@ -25,6 +25,7 @@ describe("calculated project scheduling", () => {
     const parent = scheduled.find((item) => item.id === "parent");
     expect(parent?.startDate).toBe("2026-08-02");
     expect(parent?.dueDate).toBe("2026-08-08");
+    expect(parent?.durationDays).toBe(5);
     expect(parent?.status).toBe("In Progress");
   });
 
@@ -40,5 +41,19 @@ describe("calculated project scheduling", () => {
     expect(migrated[0].subtasks).toEqual([]);
     expect(migrated[1]).toMatchObject({ id: "child-parent-s1", parentTaskId: "parent", title: "Child", assigneeId: "m1" });
     expect(taskOutline(migrated).map((row) => row.outline)).toEqual(["1", "1.1"]);
+  });
+
+  it("duplicates a parent tree and remaps child relationships and internal predecessors", () => {
+    const tasks = [
+      task("parent"),
+      { ...task("child-1"), parentTaskId: "parent", durationDays: 2 },
+      { ...task("child-2"), parentTaskId: "parent", dependencyIds: ["child-1", "external"] },
+      task("external"),
+    ];
+    const copies = duplicateTaskTree(tasks, "parent", (id) => `copy-${id}`, "2026-08-02T12:00:00.000Z", "m1");
+    expect(copies).toHaveLength(3);
+    expect(copies.find((item) => item.id === "copy-parent")).toMatchObject({ title: "parent copy", status: "Not Started", comments: 0, attachments: 0 });
+    expect(copies.find((item) => item.id === "copy-child-1")?.parentTaskId).toBe("copy-parent");
+    expect(copies.find((item) => item.id === "copy-child-2")?.dependencyIds).toEqual(["copy-child-1", "external"]);
   });
 });
