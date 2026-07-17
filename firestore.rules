@@ -110,6 +110,17 @@ service cloud.firestore {
           && request.resource.data.recipientId == resource.data.recipientId;
       }
 
+      match /pushSubscriptions/{subscriptionId} {
+        allow read: if isMember(workspaceId)
+          && resource.data.userId == request.auth.uid;
+        allow create, update: if isMember(workspaceId)
+          && request.resource.data.userId == request.auth.uid
+          && request.resource.data.fid is string
+          && request.resource.data.fid.size() > 10;
+        allow delete: if isMember(workspaceId)
+          && resource.data.userId == request.auth.uid;
+      }
+
       match /invitations/{invitationId} {
         allow create, delete: if canManage(workspaceId);
         allow read: if canManage(workspaceId)

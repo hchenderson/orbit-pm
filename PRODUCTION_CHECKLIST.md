@@ -18,6 +18,8 @@
 - [x] Baseline browser security headers
 - [x] Unit tests, linting, production build, and zero known npm vulnerabilities
 - [x] Firebase App Hosting runtime configuration
+- [x] Installable PWA, offline Firestore cache, connectivity state, and mobile deep links
+- [x] Firebase Cloud Messaging device registration and reminder/digest push delivery code
 
 ## Carter: Firebase Console tasks
 
@@ -29,6 +31,8 @@
 - [ ] Upgrade the project to the Blaze plan before using App Hosting, scheduled functions, email extensions, or production backups.
 - [ ] Create a billing budget and billing alerts in Google Cloud Billing.
 - [ ] Configure scheduled Firestore backups or exports and test one restore.
+- [ ] In **Project Settings → Cloud Messaging → Web Push certificates**, generate a key pair and add the public key to App Hosting as `NEXT_PUBLIC_FIREBASE_VAPID_KEY`.
+- [ ] Deploy the updated `firestore.rules` and `functions` after adding the Web Push key, then enable push from Orbit Settings on an iPhone/Android test device.
 
 ## Carter: product and service decisions
 

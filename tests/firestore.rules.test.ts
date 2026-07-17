@@ -82,4 +82,12 @@ rulesSuite("Firestore security rules", () => {
     await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "notifications", "n1"), notification));
     await assertFails(setDoc(doc(viewerDb, "workspaces", "w1", "notifications", "n2"), { ...notification, id: "n2" }));
   });
+
+  it("lets members register only their own push devices", async () => {
+    const memberDb = environment.authenticatedContext("member").firestore();
+    const ownerDb = environment.authenticatedContext("owner").firestore();
+    const subscription = { id: "member_device", userId: "member", fid: "a-valid-firebase-installation-id", createdAt: new Date().toISOString() };
+    await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "pushSubscriptions", "member_device"), subscription));
+    await assertFails(setDoc(doc(ownerDb, "workspaces", "w1", "pushSubscriptions", "forged"), { ...subscription, id: "forged" }));
+  });
 });

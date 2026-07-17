@@ -57,4 +57,14 @@ describe("parseTaskCsv", () => {
     expect(result.warnings.some((warning) => warning.includes("predecessor"))).toBe(true);
     expect(result.tasks[2].parentIndex).toBeUndefined();
   });
+
+  it("imports milestones, dependency lag, and baseline dates", () => {
+    const csv = [
+      "wbs,type,task,predecessors,duration_days,start,baseline_finish",
+      "1,Task,Draft,,2,2026-08-01,2026-08-02",
+      "2,Milestone,Approval,1+3d,0,2026-08-03,2026-08-06",
+    ].join("\n");
+    const result = parseTaskCsv(csv, members, "2026-08-01");
+    expect(result.tasks[1]).toMatchObject({ isMilestone: true, durationDays: 0, dependencyIndexes: [0], dependencyLags: [3], baselineDueDate: "2026-08-06" });
+  });
 });

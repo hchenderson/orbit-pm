@@ -31,6 +31,7 @@ export interface UserNotificationPreferences {
   assignmentEmails: boolean;
   mentionEmails: boolean;
   overdueEmails: boolean;
+  pushNotifications?: boolean;
 }
 
 export interface Member {
@@ -55,6 +56,11 @@ export interface Project {
   ownerId: string;
   memberIds: string[];
   archived?: boolean;
+  /** Calendar schedules include every day; business schedules skip non-working days and holidays. */
+  scheduleMode?: "calendar" | "business";
+  /** JavaScript weekday numbers. Defaults to Monday-Friday. */
+  workingDays?: number[];
+  holidays?: string[];
 }
 
 export interface TaskSubtask {
@@ -123,8 +129,19 @@ export interface Task {
   recurrenceGeneratedAt?: string;
   dependencyId?: string;
   dependencyIds?: string[];
+  /** Finish-to-start lag in schedule days, keyed by predecessor task ID. */
+  dependencyLags?: Record<string, number>;
   parentTaskId?: string;
   milestoneId?: string;
+  isMilestone?: boolean;
+  baselineStartDate?: string;
+  baselineDueDate?: string;
+  /** Denormalized UTC timestamp queried by the scheduled reminder worker. */
+  nextReminderAt?: string | null;
+  /** Changes whenever the assignee, due date, timing, or timezone changes. */
+  reminderScheduleKey?: string | null;
+  /** Prevents the same task schedule from being delivered more than once. */
+  reminderDeliveredKey?: string | null;
   createdAt: string;
   updatedAt: string;
 }

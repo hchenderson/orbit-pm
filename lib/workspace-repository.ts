@@ -13,6 +13,7 @@ import {
   type Unsubscribe,
 } from "firebase/firestore";
 import { seedData } from "./seed";
+import { withReminderSchedule } from "./reminder-schedule";
 import type { CustomTemplate, Member, Milestone, Notification, Project, SavedView, Task, WorkspaceData } from "./types";
 
 type CollectionName = "members" | "projects" | "tasks" | "notifications" | "milestones" | "savedViews" | "templates";
@@ -108,10 +109,40 @@ export function subscribeToWorkspace(db: Firestore, workspaceId: string, userId:
   let savedViews: SavedView[] = [];
   let customTemplates: CustomTemplate[] = [];
   const ready = new Set<string>();
+  let lastReminderPatchSignature = "";
 
   function emit(key: string) {
     ready.add(key);
-    if (workspace && ready.size === 8) onData({ workspaceName: workspace.workspaceName, settings: workspace.settings, members, projects, tasks, notifications, milestones, savedViews, customTemplates });
+    if (workspace && ready.size === 8) {
+      const scheduledTasks = tasks.map((task) => withReminderSchedule(task, members));
+      const patches = scheduledTasks.filter((task, index) => {
+        const current = tasks[index];
+        return task.nextReminderAt !== current.nextReminderAt
+          || task.reminderScheduleKey !== current.reminderScheduleKey
+          || task.reminderDeliveredKey !== current.reminderDeliveredKey;
+      });
+      tasks = scheduledTasks;
+      onData({ workspaceName: workspace.workspaceName, settings: workspace.settings, members, projects, tasks, notifications, milestones, savedViews, customTemplates });
+      const currentMember = members.find((member) => member.id === userId);
+      const signature = patches.map((task) => `${task.id}:${task.reminderScheduleKey}:${task.nextReminderAt}:${task.reminderDeliveredKey}`).join(";");
+      if (patches.length && currentMember?.role !== "Viewer" && signature !== lastReminderPatchSignature) {
+        lastReminderPatchSignature = signature;
+        void (async () => {
+          for (let offset = 0; offset < patches.length; offset += 450) {
+            const batch = writeBatch(db);
+            for (const task of patches.slice(offset, offset + 450)) {
+              batch.set(doc(db, "workspaces", workspaceId, "tasks", task.id), withoutUndefined({
+                nextReminderAt: task.nextReminderAt ?? null,
+                reminderScheduleKey: task.reminderScheduleKey ?? null,
+                reminderDeliveredKey: task.reminderDeliveredKey ?? null,
+              }), { merge: true });
+            }
+            await batch.commit();
+          }
+        })().catch((error: unknown) => fail(error instanceof Error ? error : new Error("Reminder schedules could not be saved")));
+      }
+      if (!patches.length) lastReminderPatchSignature = "";
+    }
   }
 
   const fail = (error: Error) => onError(error);
@@ -155,7 +186,9 @@ export async function syncWorkspace(db: Firestore, workspaceId: string, userId: 
   }
   operations.push(syncCollection(db, workspaceId, "members", previous.members, next.members));
   operations.push(syncCollection(db, workspaceId, "projects", previous.projects, next.projects));
-  operations.push(syncCollection(db, workspaceId, "tasks", previous.tasks, next.tasks));
+  const previousTasks = previous.tasks.map((task) => withReminderSchedule(task, previous.members));
+  const nextTasks = next.tasks.map((task) => withReminderSchedule(task, next.members));
+  operations.push(syncCollection(db, workspaceId, "tasks", previousTasks, nextTasks));
   operations.push(syncCollection(db, workspaceId, "notifications", previous.notifications, next.notifications, (notification) => ({ ...notification, recipientId: notification.recipientId ?? userId })));
   operations.push(syncCollection(db, workspaceId, "milestones", previous.milestones ?? [], next.milestones ?? []));
   operations.push(syncCollection(db, workspaceId, "savedViews", previous.savedViews ?? [], next.savedViews ?? []));

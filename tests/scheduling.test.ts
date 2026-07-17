@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { duplicateTaskTree, migrateLegacySubtasks, recalculateProjectSchedule, taskOutline, wouldCreateDependencyCycle, wouldCreateParentCycle } from "../lib/scheduling";
+import { analyzeProjectSchedule, duplicateTaskTree, migrateLegacySubtasks, recalculateProjectSchedule, taskOutline, wouldCreateDependencyCycle, wouldCreateParentCycle } from "../lib/scheduling";
 import type { Project, Task } from "../lib/types";
 
 const project: Project = { id: "p1", name: "Plan", description: "", icon: "P", color: "#000", status: "Active", startDate: "2026-08-01", dueDate: "2026-09-01", ownerId: "m1", memberIds: ["m1"] };
@@ -55,5 +55,29 @@ describe("calculated project scheduling", () => {
     expect(copies.find((item) => item.id === "copy-parent")).toMatchObject({ title: "parent copy", status: "Not Started", comments: 0, attachments: 0 });
     expect(copies.find((item) => item.id === "copy-child-1")?.parentTaskId).toBe("copy-parent");
     expect(copies.find((item) => item.id === "copy-child-2")?.dependencyIds).toEqual(["copy-child-1", "external"]);
+  });
+
+  it("uses business days and finish-to-start lag", () => {
+    const businessProject = { ...project, startDate: "2026-08-07", scheduleMode: "business" as const, holidays: ["2026-08-10"] };
+    const scheduled = recalculateProjectSchedule([
+      { ...task("a", "2026-08-07"), durationDays: 1 },
+      { ...task("b", "2026-08-07"), durationDays: 2, dependencyIds: ["a"], dependencyLags: { a: 1 } },
+    ], businessProject);
+    expect(scheduled.find((item) => item.id === "b")?.startDate).toBe("2026-08-12");
+    expect(scheduled.find((item) => item.id === "b")?.dueDate).toBe("2026-08-13");
+  });
+
+  it("supports zero-day milestones and reports the critical chain and baseline slips", () => {
+    const scheduled = recalculateProjectSchedule([
+      { ...task("draft"), durationDays: 3 },
+      { ...task("review"), durationDays: 2, dependencyIds: ["draft"], baselineDueDate: "2026-08-04" },
+      { ...task("launch"), isMilestone: true, durationDays: 0, dependencyIds: ["review"] },
+      { ...task("side"), durationDays: 1 },
+    ], project);
+    const launch = scheduled.find((item) => item.id === "launch");
+    expect(launch?.startDate).toBe(launch?.dueDate);
+    const analysis = analyzeProjectSchedule(scheduled, project);
+    expect([...analysis.criticalTaskIds]).toEqual(expect.arrayContaining(["draft", "review", "launch"]));
+    expect(analysis.issues.some((issue) => issue.kind === "baseline-slip" && issue.taskId === "review")).toBe(true);
   });
 });

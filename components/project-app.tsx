@@ -55,7 +55,7 @@ import { seedData } from "@/lib/seed";
 import { ProjectCalendar } from "@/components/project-calendar";
 import { ScheduleTable } from "@/components/schedule-table";
 import { TaskDetailDrawer } from "@/components/task-detail-drawer";
-import { enableFirebaseAnalytics, enableFirebaseAppCheck, getFirebaseAuth, getFirebaseFirestore, getFirebaseStorage, isDemoMode, isFirebaseConfigured } from "@/lib/firebase";
+import { clearFirebaseOfflineCache, disablePushNotifications, enableFirebaseAnalytics, enableFirebaseAppCheck, enablePushNotifications, getFirebaseAuth, getFirebaseFirestore, getFirebaseStorage, isDemoMode, isFirebaseConfigured } from "@/lib/firebase";
 import { parseTaskCsv, type ImportedTask } from "@/lib/csv-import";
 import { csvColumns, projectTemplates, sampleCsv, type ProjectTemplate } from "@/lib/project-templates";
 import { onAuthStateChanged, sendEmailVerification, signOut } from "firebase/auth";
@@ -64,12 +64,22 @@ import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage
 import { ensureUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
 import { createWorkspaceInvitation, resendWorkspaceInvitation, revokeWorkspaceInvitation, subscribeToWorkspaceInvitations } from "@/lib/invitations";
 import { dateLabel, daysUntil, filterTasks, isDueToday, isOverdue, PRIORITIES, taskProgress, TASK_STATUSES } from "@/lib/task-utils";
-import { duplicateTaskTree, inclusiveDuration, migrateLegacySubtasks, recalculateProjectSchedule, taskDuration, taskOutline } from "@/lib/scheduling";
+import { duplicateTaskTree, inclusiveDuration, migrateLegacySubtasks, recalculateProjectSchedule, taskDuration, taskOutline, wouldCreateParentCycle } from "@/lib/scheduling";
 import type { CustomTemplate, Member, Priority, Project, Role, SavedView, Task, TaskAttachment, TaskComment, TaskStatus, ViewMode, WorkspaceData, WorkspaceInvitation } from "@/lib/types";
 
 const STORAGE_KEY = "orbit-workspace-v1";
 const SIDEBAR_KEY = "orbit-sidebar-collapsed";
 type AppSection = "project" | "people" | "inbox" | "settings";
+
+interface WorkspaceHistoryEntry {
+  id: string;
+  label: string;
+  time: string;
+  timestamp: number;
+  mergeKey: string;
+  before: WorkspaceData;
+  after: WorkspaceData;
+}
 
 const viewOptions: { id: ViewMode; label: string; icon: typeof List }[] = [
   { id: "overview", label: "Overview", icon: LayoutDashboard },
@@ -165,6 +175,58 @@ export function ProjectApp() {
   const queuedCloudDataRef = useRef<WorkspaceData | null>(null);
   const pendingSyncsRef = useRef(0);
   const syncQueueRef = useRef(Promise.resolve());
+  const dataRef = useRef(data);
+  const undoHistoryRef = useRef<WorkspaceHistoryEntry[]>([]);
+  const redoHistoryRef = useRef<WorkspaceHistoryEntry[]>([]);
+  const [, setHistoryRevision] = useState(0);
+  const deepLinkHandledRef = useRef(false);
+
+  useEffect(() => {
+    dataRef.current = data;
+  }, [data]);
+
+  function commitWorkspaceChange(label: string, updater: (current: WorkspaceData) => WorkspaceData, mergeKey = label) {
+    const current = dataRef.current;
+    const next = updater(current);
+    if (next === current || JSON.stringify(next) === JSON.stringify(current)) return;
+    const now = Date.now();
+    const snapshot = (value: WorkspaceData) => structuredClone(value);
+    const mostRecent = undoHistoryRef.current[0];
+    if (mostRecent && mostRecent.mergeKey === mergeKey && now - mostRecent.timestamp < 900) {
+      mostRecent.after = snapshot(next);
+      mostRecent.timestamp = now;
+      mostRecent.time = new Date(now).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    } else {
+      undoHistoryRef.current.unshift({ id: uid("history"), label, mergeKey, timestamp: now, time: new Date(now).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }), before: snapshot(current), after: snapshot(next) });
+      undoHistoryRef.current = undoHistoryRef.current.slice(0, 30);
+    }
+    redoHistoryRef.current = [];
+    dataRef.current = next;
+    setData(next);
+    setHistoryRevision((value) => value + 1);
+  }
+
+  function undoWorkspaceChange() {
+    const entry = undoHistoryRef.current.shift();
+    if (!entry) return;
+    redoHistoryRef.current.unshift(entry);
+    const restored = structuredClone(entry.before);
+    dataRef.current = restored;
+    setData(restored);
+    setHistoryRevision((value) => value + 1);
+    setToast(`Undid: ${entry.label}`);
+  }
+
+  function redoWorkspaceChange() {
+    const entry = redoHistoryRef.current.shift();
+    if (!entry) return;
+    undoHistoryRef.current.unshift(entry);
+    const restored = structuredClone(entry.after);
+    dataRef.current = restored;
+    setData(restored);
+    setHistoryRevision((value) => value + 1);
+    setToast(`Redid: ${entry.label}`);
+  }
 
   useEffect(() => {
     setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_KEY) === "true");
@@ -281,6 +343,16 @@ export function ProjectApp() {
     return () => window.clearTimeout(timer);
   }, [toast]);
 
+  useEffect(() => {
+    if (!loaded || deepLinkHandledRef.current) return;
+    deepLinkHandledRef.current = true;
+    const parameters = new URLSearchParams(window.location.search);
+    const taskId = parameters.get("task");
+    if (taskId && data.tasks.some((task) => task.id === taskId)) setSelectedTaskId(taskId);
+    if (parameters.get("view") === "my-tasks") { setSection("project"); setMyTasksOnly(true); setView("list"); }
+    if (parameters.get("new-task") === "1") setTaskModalOpen(true);
+  }, [data.tasks, loaded]);
+
   const activeProject = data.projects.find((project) => project.id === activeProjectId) ?? data.projects[0];
   const projectTasks = data.tasks.filter((task) => task.projectId === activeProject?.id);
   const visibleTasks = useMemo(() => {
@@ -290,6 +362,7 @@ export function ProjectApp() {
   const selectedTask = data.tasks.find((task) => task.id === selectedTaskId) ?? null;
   const unreadCount = data.notifications.filter((notification) => !notification.read).length;
   const currentMember = data.members.find((member) => member.id === currentUserId) ?? data.members[0];
+  const scheduleHistory = undoHistoryRef.current.map(({ id, label, time }) => ({ id, label, time })).slice(0, 8);
 
   function openSection(next: AppSection) {
     setSection(next);
@@ -310,7 +383,15 @@ export function ProjectApp() {
   async function handleSignOut() {
     const auth = getFirebaseAuth();
     if (auth?.currentUser) await signOut(auth);
+    await clearFirebaseOfflineCache();
     window.location.href = "/sign-in";
+  }
+
+  async function handleSwitchAccount() {
+    const auth = getFirebaseAuth();
+    if (auth?.currentUser) await signOut(auth);
+    await clearFirebaseOfflineCache();
+    window.location.href = "/sign-in?switch=1";
   }
 
   function saveProject(project: Project, tasks: Task[]) {
@@ -327,14 +408,16 @@ export function ProjectApp() {
   }
 
   function updateTask(taskId: string, patch: Partial<Task>) {
-    setData((current) => {
+    const changedField = Object.keys(patch).sort().join(",");
+    commitWorkspaceChange(`Edited task`, (current) => {
       const existing = current.tasks.find((task) => task.id === taskId);
       if (!existing) return current;
       const timestamp = new Date().toISOString();
       const statusChanged = patch.status && patch.status !== existing.status;
       const event = statusChanged ? { id: uid("activity"), actorId: currentUserId, kind: patch.status === "Complete" ? "completed" as const : "updated" as const, summary: patch.status === "Complete" ? `completed ${existing.title}` : `moved ${existing.title} to ${patch.status}`, createdAt: timestamp } : null;
       const requestedActivity = patch.activity ?? existing.activity ?? [];
-      const updated: Task = { ...existing, ...patch, durationDays: patch.dueDate && patch.durationDays === undefined ? inclusiveDuration(patch.startDate ?? existing.startDate, patch.dueDate) : Math.max(1, Math.floor(patch.durationDays ?? taskDuration(existing))), activity: event ? [...requestedActivity, event] : requestedActivity, updatedAt: timestamp };
+      const minimumDuration = (patch.isMilestone ?? existing.isMilestone) ? 0 : 1;
+      const updated: Task = { ...existing, ...patch, durationDays: patch.dueDate && patch.durationDays === undefined ? inclusiveDuration(patch.startDate ?? existing.startDate, patch.dueDate) : Math.max(minimumDuration, Math.floor(patch.durationDays ?? taskDuration(existing))), activity: event ? [...requestedActivity, event] : requestedActivity, updatedAt: timestamp };
       let tasks = current.tasks.map((task) => task.id === taskId ? updated : task);
       const recurrence = updated.recurrence ?? (updated.recurring ? { frequency: "monthly" as const, interval: 1 } : undefined);
       if (patch.status === "Complete" && existing.status !== "Complete" && recurrence && !existing.recurrenceGeneratedAt) {
@@ -345,11 +428,32 @@ export function ProjectApp() {
       }
       const project = current.projects.find((item) => item.id === existing.projectId);
       return { ...current, tasks: project ? recalculateProjectSchedule(tasks, project) : tasks };
+    }, `task:${taskId}:${changedField}`);
+  }
+
+  function updateTasks(updates: { id: string; patch: Partial<Task> }[], label: string) {
+    if (!updates.length) return;
+    commitWorkspaceChange(label, (current) => {
+      const byId = new Map(updates.map((update) => [update.id, update.patch]));
+      const timestamp = new Date().toISOString();
+      let tasks = current.tasks.map((task) => {
+        const patch = byId.get(task.id);
+        if (!patch) return task;
+        const minimumDuration = (patch.isMilestone ?? task.isMilestone) ? 0 : 1;
+        return { ...task, ...patch, durationDays: Math.max(minimumDuration, Math.floor(patch.durationDays ?? taskDuration(task))), updatedAt: timestamp };
+      });
+      const projectIds = [...new Set(current.tasks.filter((task) => byId.has(task.id)).map((task) => task.projectId))];
+      for (const projectId of projectIds) {
+        const project = current.projects.find((item) => item.id === projectId);
+        if (project) tasks = recalculateProjectSchedule(tasks, project);
+      }
+      return { ...current, tasks };
     });
+    setToast(label);
   }
 
   function addChildTask(parentTaskId: string, title: string) {
-    setData((current) => {
+    commitWorkspaceChange("Added child task", (current) => {
       const parent = current.tasks.find((task) => task.id === parentTaskId);
       const project = parent ? current.projects.find((item) => item.id === parent.projectId) : undefined;
       if (!parent || !project) return current;
@@ -367,8 +471,15 @@ export function ProjectApp() {
     }
     const timestamp = new Date().toISOString();
     const task: Task = { id: uid("task"), projectId: activeProject.id, title: "New task", description: "", status: "Not Started", priority: "Medium", assigneeId: currentUserId, startDate: activeProject.startDate, dueDate: activeProject.startDate, durationDays: 1, estimate: 0, labels: [], subtasks: [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created", summary: "created New task", createdAt: timestamp }], dependencyIds: [], createdAt: timestamp, updatedAt: timestamp };
-    setData((current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) }));
+    commitWorkspaceChange("Added task row", (current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) }));
     setToast("Task row added");
+  }
+
+  function addScheduleMilestone() {
+    const timestamp = new Date().toISOString();
+    const milestone: Task = { id: uid("task"), projectId: activeProject.id, title: "New milestone", description: "", status: "Not Started", priority: "Medium", assigneeId: currentUserId, startDate: activeProject.startDate, dueDate: activeProject.startDate, durationDays: 0, isMilestone: true, estimate: 0, labels: ["Milestone"], subtasks: [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created", summary: "created New milestone", createdAt: timestamp }], dependencyIds: [], dependencyLags: {}, createdAt: timestamp, updatedAt: timestamp };
+    commitWorkspaceChange("Added milestone", (current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, milestone], activeProject) }));
+    setToast("Milestone added");
   }
 
   function addComment(taskId: string, body: string) {
@@ -447,7 +558,7 @@ export function ProjectApp() {
   }
 
   function bulkUpdate(taskIds: string[], patch: Partial<Task>) {
-    setData((current) => {
+    commitWorkspaceChange(`Updated ${taskIds.length} task${taskIds.length === 1 ? "" : "s"}`, (current) => {
       const timestamp = new Date().toISOString();
       let tasks = current.tasks.map((task) => taskIds.includes(task.id) ? { ...task, ...patch, durationDays: patch.durationDays ?? taskDuration(task), updatedAt: timestamp } : task);
       const projectIds = [...new Set(tasks.filter((task) => taskIds.includes(task.id)).map((task) => task.projectId))];
@@ -462,14 +573,14 @@ export function ProjectApp() {
 
   function bulkDelete(taskIds: string[]) {
     if (!window.confirm(`Delete ${taskIds.length} selected task${taskIds.length === 1 ? "" : "s"}?`)) return;
-    setData((current) => {
+    commitWorkspaceChange(`Deleted ${taskIds.length} task${taskIds.length === 1 ? "" : "s"}`, (current) => {
       const removed = new Set(taskIds);
       let changed = true;
       while (changed) {
         changed = false;
         for (const task of current.tasks) if (task.parentTaskId && removed.has(task.parentTaskId) && !removed.has(task.id)) { removed.add(task.id); changed = true; }
       }
-      let tasks: Task[] = current.tasks.filter((task) => !removed.has(task.id)).map((task) => ({ ...task, dependencyIds: (task.dependencyIds ?? []).filter((id) => !removed.has(id)) }));
+      let tasks: Task[] = current.tasks.filter((task) => !removed.has(task.id)).map((task) => ({ ...task, dependencyIds: (task.dependencyIds ?? []).filter((id) => !removed.has(id)), dependencyLags: Object.fromEntries(Object.entries(task.dependencyLags ?? {}).filter(([id]) => !removed.has(id))) }));
       for (const project of current.projects) tasks = recalculateProjectSchedule(tasks, project);
       return { ...current, tasks };
     });
@@ -477,15 +588,15 @@ export function ProjectApp() {
   }
 
   function deleteTask(taskId: string) {
-    if (!window.confirm("Delete this task? This can’t be undone.")) return;
-    setData((current) => {
+    if (!window.confirm("Delete this task and its child tasks? You can undo this from the Table view.")) return;
+    commitWorkspaceChange("Deleted task tree", (current) => {
       const removed = new Set([taskId]);
       let changed = true;
       while (changed) {
         changed = false;
         for (const task of current.tasks) if (task.parentTaskId && removed.has(task.parentTaskId) && !removed.has(task.id)) { removed.add(task.id); changed = true; }
       }
-      let tasks: Task[] = current.tasks.filter((task) => !removed.has(task.id)).map((task) => ({ ...task, dependencyIds: (task.dependencyIds ?? []).filter((id) => !removed.has(id)) }));
+      let tasks: Task[] = current.tasks.filter((task) => !removed.has(task.id)).map((task) => ({ ...task, dependencyIds: (task.dependencyIds ?? []).filter((id) => !removed.has(id)), dependencyLags: Object.fromEntries(Object.entries(task.dependencyLags ?? {}).filter(([id]) => !removed.has(id))) }));
       for (const project of current.projects) tasks = recalculateProjectSchedule(tasks, project);
       return { ...current, tasks };
     });
@@ -495,7 +606,7 @@ export function ProjectApp() {
 
   function duplicateTask(taskId: string) {
     const duplicatedRootId = uid("task");
-    setData((current) => {
+    commitWorkspaceChange("Duplicated task tree", (current) => {
       const original = current.tasks.find((task) => task.id === taskId);
       const project = original ? current.projects.find((item) => item.id === original.projectId) : undefined;
       if (!original || !project) return current;
@@ -518,6 +629,7 @@ export function ProjectApp() {
       projectId,
       parentTaskId: task.parentTaskId ? taskIds.get(task.parentTaskId) : undefined,
       dependencyIds: (task.dependencyIds ?? []).map((id) => taskIds.get(id)).filter((id): id is string => Boolean(id)),
+      dependencyLags: Object.fromEntries(Object.entries(task.dependencyLags ?? {}).flatMap(([id, lag]) => taskIds.get(id) ? [[taskIds.get(id)!, lag]] : [])),
       dependencyId: undefined,
       status: "Not Started",
       recurrenceGeneratedAt: undefined,
@@ -563,6 +675,9 @@ export function ProjectApp() {
         labels: task.labels,
         parentTaskId: task.parentIndex === undefined ? undefined : taskIds[task.parentIndex],
         dependencyIds: task.dependencyIndexes?.map((dependencyIndex) => taskIds[dependencyIndex]).filter(Boolean) ?? [],
+        dependencyLags: Object.fromEntries((task.dependencyIndexes ?? []).map((dependencyIndex, dependencyPosition) => [taskIds[dependencyIndex], task.dependencyLags?.[dependencyPosition] ?? 0])),
+        isMilestone: task.isMilestone,
+        baselineDueDate: task.baselineDueDate,
         subtasks: [],
         comments: 0,
         attachments: 0,
@@ -575,7 +690,7 @@ export function ProjectApp() {
       const importedStart = additions.map((task) => task.startDate).sort()[0];
       const importedDue = additions.map((task) => task.dueDate).sort().at(-1)!;
 
-      setData((current) => {
+      commitWorkspaceChange(`Imported ${additions.length} task${additions.length === 1 ? "" : "s"}`, (current) => {
         const project = current.projects.find((item) => item.id === projectId);
         if (!project) return current;
         const updatedProject = {
@@ -595,18 +710,75 @@ export function ProjectApp() {
     reader.readAsText(file);
   }
 
+  function updateActiveProject(patch: Partial<Project>) {
+    commitWorkspaceChange("Updated project schedule", (current) => {
+      const project = current.projects.find((item) => item.id === activeProject.id);
+      if (!project) return current;
+      const updated = { ...project, ...patch };
+      return { ...current, projects: current.projects.map((item) => item.id === project.id ? updated : item), tasks: recalculateProjectSchedule(current.tasks, updated) };
+    });
+    setToast("Schedule recalculated");
+  }
+
+  function captureScheduleBaseline() {
+    commitWorkspaceChange("Captured schedule baseline", (current) => ({
+      ...current,
+      tasks: current.tasks.map((task) => task.projectId === activeProject.id ? { ...task, baselineStartDate: task.startDate, baselineDueDate: task.dueDate, updatedAt: new Date().toISOString() } : task),
+    }));
+    setToast("Baseline saved for every project task");
+  }
+
+  function reorderScheduleTask(taskId: string, beforeTaskId: string) {
+    if (taskId === beforeTaskId) return;
+    commitWorkspaceChange("Reordered schedule row", (current) => {
+      const sourceIndex = current.tasks.findIndex((task) => task.id === taskId);
+      const targetIndex = current.tasks.findIndex((task) => task.id === beforeTaskId);
+      if (sourceIndex < 0 || targetIndex < 0) return current;
+      const tasks = [...current.tasks];
+      const [source] = tasks.splice(sourceIndex, 1);
+      const adjustedTarget = tasks.findIndex((task) => task.id === beforeTaskId);
+      tasks.splice(adjustedTarget, 0, source);
+      return { ...current, tasks };
+    });
+  }
+
+  function indentScheduleTask(taskId: string) {
+    const rows = taskOutline(projectTasks);
+    const index = rows.findIndex((row) => row.task.id === taskId);
+    const previous = rows[index - 1]?.task;
+    if (!previous || wouldCreateParentCycle(projectTasks, taskId, previous.id)) {
+      setToast("This row cannot be indented here");
+      return;
+    }
+    updateTask(taskId, { parentTaskId: previous.id });
+    setToast(`Indented under ${previous.title}`);
+  }
+
+  function outdentScheduleTask(taskId: string) {
+    const task = projectTasks.find((item) => item.id === taskId);
+    if (!task?.parentTaskId) {
+      setToast("This row is already at the top level");
+      return;
+    }
+    const parent = projectTasks.find((item) => item.id === task.parentTaskId);
+    updateTask(taskId, { parentTaskId: parent?.parentTaskId });
+    setToast("Row outdented");
+  }
+
   function exportCsv() {
     const outlined = taskOutline(visibleTasks);
     const rowNumbers = new Map(outlined.map((row) => [row.task.id, row.outline]));
-    const header = ["WBS", "Task", "Parent", "Predecessors", "Duration (days)", "Start", "Finish", "Status", "Priority", "Assignee", "Estimate (hours)"];
+    const header = ["WBS", "Type", "Task", "Parent", "Predecessors", "Duration (days)", "Start", "Finish", "Baseline Finish", "Status", "Priority", "Assignee", "Estimate (hours)"];
     const rows = outlined.map(({ task, outline }) => [
       outline,
+      task.isMilestone ? "Milestone" : task.parentTaskId ? "Child Task" : "Task",
       task.title,
       task.parentTaskId ? rowNumbers.get(task.parentTaskId) ?? task.parentTaskId : "",
-      (task.dependencyIds ?? []).map((id) => rowNumbers.get(id) ?? id).join(", "),
+      (task.dependencyIds ?? []).map((id) => { const lag = task.dependencyLags?.[id] ?? 0; return `${rowNumbers.get(id) ?? id}${lag ? `${lag > 0 ? "+" : ""}${lag}d` : ""}`; }).join(", "),
       taskDuration(task),
       task.startDate,
       task.dueDate,
+      task.baselineDueDate ?? "",
       task.status,
       task.priority,
       data.members.find((member) => member.id === task.assigneeId)?.name ?? "",
@@ -747,16 +919,16 @@ export function ProjectApp() {
           {section === "project" && view === "list" && <ListView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
           {section === "project" && view === "board" && <BoardView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
           {section === "project" && view === "timeline" && <TimelineView data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} importCsv={importCsvIntoProject} />}
-          {section === "project" && view === "table" && <ScheduleTable data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} onAddTask={addScheduleTask} importCsv={importCsvIntoProject} exportCsv={exportCsv} />}
+          {section === "project" && view === "table" && <ScheduleTable data={data} project={activeProject} tasks={projectTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onTaskUpdates={updateTasks} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} onAddTask={addScheduleTask} onAddMilestone={addScheduleMilestone} onProjectUpdate={updateActiveProject} onCaptureBaseline={captureScheduleBaseline} onReorder={reorderScheduleTask} onIndent={indentScheduleTask} onOutdent={outdentScheduleTask} history={scheduleHistory} canUndo={undoHistoryRef.current.length > 0} canRedo={redoHistoryRef.current.length > 0} onUndo={undoWorkspaceChange} onRedo={redoWorkspaceChange} importCsv={importCsvIntoProject} exportCsv={exportCsv} />}
           {section === "project" && view === "calendar" && <ProjectCalendar data={data} tasks={visibleTasks} onTask={setSelectedTaskId} />}
           {section === "people" && <PeopleManagementView data={data} invitations={invitations} invite={() => setInviteModalOpen(true)} resend={(invitation) => void resendInvitation(invitation)} revoke={(invitation) => void revokeInvitation(invitation)} updateRole={(memberId, role) => setData((current) => ({ ...current, members: current.members.map((member) => member.id === memberId ? { ...member, role } : member) }))} />}
           {section === "inbox" && <InboxView data={data} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} markOne={(id) => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => notification.id === id ? { ...notification, read: true } : notification) }))} openSettings={() => openSection("settings")} />}
-          {section === "settings" && <SettingsView data={data} currentUserId={currentUserId} dataMode={dataMode} update={(patch) => setData((current) => ({ ...current, ...patch }))} notify={setToast} />}
+          {section === "settings" && <SettingsView data={data} currentUserId={currentUserId} workspaceId={workspaceId} dataMode={dataMode} update={(patch) => setData((current) => ({ ...current, ...patch }))} notify={setToast} />}
         </section>
       </main>
 
       {notificationsOpen && <NotificationPanel data={data} close={() => setNotificationsOpen(false)} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openInbox={() => openSection("inbox")} openSettings={() => openSection("settings")} />}
-      {profileMenuOpen && <ProfileMenu member={currentMember} firebaseConnected={dataMode === "firestore"} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} switchAccount={() => { window.location.href = "/sign-in?switch=1"; }} signOut={() => void handleSignOut()} />}
+      {profileMenuOpen && <ProfileMenu member={currentMember} firebaseConnected={dataMode === "firestore"} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} switchAccount={() => void handleSwitchAccount()} signOut={() => void handleSignOut()} />}
       {selectedTask && <TaskDetailDrawer data={data} task={selectedTask} currentUserId={currentUserId} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} duplicate={duplicateTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} addChild={addChildTask} openTask={setSelectedTaskId} />}
       {taskModalOpen && <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={(task) => { setData((current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) })); setTaskModalOpen(false); setToast("Task created"); }} />}
       {projectModalOpen && <ProjectModal data={data} close={() => setProjectModalOpen(false)} save={saveProject} />}
@@ -870,22 +1042,49 @@ function Toggle({ checked, onChange, label, description }: { checked: boolean; o
   return <label className="setting-toggle"><span><strong>{label}</strong><small>{description}</small></span><input type="checkbox" checked={checked} onChange={(event) => onChange(event.target.checked)} /><i /></label>;
 }
 
-function SettingsView({ data, currentUserId, dataMode, update, notify }: { data: WorkspaceData; currentUserId: string; dataMode: "loading" | "local" | "firestore"; update: (patch: Partial<WorkspaceData>) => void; notify: (message: string) => void }) {
+function SettingsView({ data, currentUserId, workspaceId, dataMode, update, notify }: { data: WorkspaceData; currentUserId: string; workspaceId: string; dataMode: "loading" | "local" | "firestore"; update: (patch: Partial<WorkspaceData>) => void; notify: (message: string) => void }) {
   const settings = { ...seedData.settings!, ...data.settings };
   const currentMember = data.members.find((member) => member.id === currentUserId) ?? data.members[0];
   const legacyPreferences = currentMember.preferences as (typeof currentMember.preferences & { reminderHoursBefore?: number }) | undefined;
   const preferences = { reminderDaysBefore: legacyPreferences?.reminderDaysBefore ?? Math.ceil((legacyPreferences?.reminderHoursBefore ?? 24) / 24), reminderTime: legacyPreferences?.reminderTime ?? settings.reminderTime, timezone: settings.timezone, dailyDigestTime: settings.dailyDigestTime, reminderEmail: settings.reminderEmail, reminderInApp: settings.reminderInApp, dailyDigest: settings.dailyDigest, assignmentEmails: settings.assignmentEmails, mentionEmails: settings.mentionEmails, overdueEmails: settings.overdueEmails, ...currentMember.preferences };
   const [workspaceName, setWorkspaceName] = useState(data.workspaceName);
   const [verificationSent, setVerificationSent] = useState(false);
+  const [pushBusy, setPushBusy] = useState(false);
   const authUser = getFirebaseAuth()?.currentUser;
   function updateSettings(patch: Partial<typeof settings>) { update({ settings: { ...settings, ...patch } }); }
   function updatePreferences(patch: Partial<typeof preferences>) { update({ members: data.members.map((member) => member.id === currentMember.id ? { ...member, preferences: { ...preferences, ...patch } } : member) }); }
+  async function turnOnPush() {
+    setPushBusy(true);
+    try {
+      const result = await enablePushNotifications(workspaceId, currentUserId);
+      if (result === "enabled") { updatePreferences({ pushNotifications: true }); notify("Push notifications enabled on this device"); }
+      if (result === "denied") notify("Push permission was declined. You can change it in your browser settings.");
+      if (result === "unsupported") notify("This browser does not support Orbit push notifications.");
+      if (result === "needs-vapid-key") notify("Push is ready for a Firebase Web Push certificate key.");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Push notifications could not be enabled");
+    } finally {
+      setPushBusy(false);
+    }
+  }
+  async function turnOffPush() {
+    setPushBusy(true);
+    try {
+      await disablePushNotifications(workspaceId, currentUserId);
+      updatePreferences({ pushNotifications: false });
+      notify("Push notifications disabled on this device");
+    } catch (error) {
+      notify(error instanceof Error ? error.message : "Push notifications could not be disabled");
+    } finally {
+      setPushBusy(false);
+    }
+  }
   return <div className="management-page">
     <SectionHeader eyebrow="Workspace" title="Settings" description="Manage workspace details, defaults, and notifications." action={<span className={`connection-badge ${dataMode === "firestore" ? "connected" : ""}`}><i />{dataMode === "firestore" ? "Firestore connected" : "Local demo mode"}</span>} />
     <div className="settings-layout"><nav className="settings-nav"><button className="active"><Settings size={15} /> General</button><button><Bell size={15} /> Notifications</button><button><ShieldCheck size={15} /> Permissions</button><button><Link2 size={15} /> Integrations</button></nav><div className="settings-content">
       <section className="settings-card"><header><h2>Workspace details</h2><p>The name and identity your team sees throughout Orbit.</p></header><div className="settings-fields"><label>Workspace name<input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} /></label><label>Workspace URL<div className="url-input"><span>orbit.app/</span><input value="northstar-studio" readOnly /></div></label><label>Week starts on<select value={settings.weekStartsOn} onChange={(event) => updateSettings({ weekStartsOn: event.target.value as "Sunday" | "Monday" })}><option>Monday</option><option>Sunday</option></select></label><label>Default project view<select value={settings.defaultView} onChange={(event) => updateSettings({ defaultView: event.target.value as ViewMode })}>{viewOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label></div><footer><button className="primary-button" onClick={() => { if (workspaceName.trim()) update({ workspaceName: workspaceName.trim() }); notify("Workspace settings saved"); }}>Save changes</button></footer></section>
       <section className="settings-card"><header><h2>Account security</h2><p>Password recovery and email ownership are handled securely by Firebase Authentication.</p></header><dl className="account-security"><div><dt>Email</dt><dd>{authUser?.email ?? currentMember.email}</dd></div><div><dt>Verification</dt><dd>{authUser?.emailVerified ? "Verified" : verificationSent ? "Verification email sent" : "Not verified"}</dd></div></dl>{authUser && !authUser.emailVerified && <footer><button className="secondary-button" disabled={verificationSent} onClick={() => void sendEmailVerification(authUser).then(() => { setVerificationSent(true); notify("Verification email sent"); }).catch((error: unknown) => notify(error instanceof Error ? error.message : "Verification could not be sent"))}>Send verification email</button></footer>}</section>
-      <section className="settings-card"><header><h2>My reminders and email</h2><p>Customize timing, timezone, digest delivery, and channels for your account.</p></header><div className="settings-fields"><label>Remind me before due date<input type="number" min="0" max="365" step="1" value={preferences.reminderDaysBefore} onChange={(event) => updatePreferences({ reminderDaysBefore: Math.max(0, Math.floor(Number(event.target.value))) })} /><small className="field-help">Days before the task is due</small></label><label>Reminder delivery time<input type="time" value={preferences.reminderTime} onChange={(event) => updatePreferences({ reminderTime: event.target.value })} /><small className="field-help">Uses your timezone below</small></label><label>Timezone<input value={preferences.timezone} onChange={(event) => updatePreferences({ timezone: event.target.value })} placeholder="America/New_York" /></label><label>Daily digest time<input type="time" value={preferences.dailyDigestTime} onChange={(event) => updatePreferences({ dailyDigestTime: event.target.value })} /></label></div><div className="settings-fields single-column reminder-toggles"><Toggle checked={preferences.reminderInApp} onChange={(checked) => updatePreferences({ reminderInApp: checked })} label="In-app reminders" description="Create notifications in Orbit." /><Toggle checked={preferences.reminderEmail} onChange={(checked) => updatePreferences({ reminderEmail: checked })} label="Email reminders" description="Send one reminder per task and due date." /><Toggle checked={preferences.assignmentEmails} onChange={(checked) => updatePreferences({ assignmentEmails: checked })} label="Task assignments" description="Email me when a task is assigned to me." /><Toggle checked={preferences.mentionEmails} onChange={(checked) => updatePreferences({ mentionEmails: checked })} label="Mentions and comments" description="Email me when someone mentions me." /><Toggle checked={preferences.overdueEmails} onChange={(checked) => updatePreferences({ overdueEmails: checked })} label="Overdue reminders" description="Send a daily reminder for overdue work." /><Toggle checked={preferences.dailyDigest} onChange={(checked) => updatePreferences({ dailyDigest: checked })} label="Daily digest" description={`Deliver a summary at ${preferences.dailyDigestTime} in ${preferences.timezone}.`} /></div></section>
+      <section className="settings-card"><header><h2>My reminders and email</h2><p>Customize timing, timezone, digest delivery, and channels for your account.</p></header><div className="settings-fields"><label>Remind me before due date<input type="number" min="0" max="365" step="1" value={preferences.reminderDaysBefore} onChange={(event) => updatePreferences({ reminderDaysBefore: Math.max(0, Math.floor(Number(event.target.value))) })} /><small className="field-help">Days before the task is due</small></label><label>Reminder delivery time<input type="time" value={preferences.reminderTime} onChange={(event) => updatePreferences({ reminderTime: event.target.value })} /><small className="field-help">Uses your timezone below</small></label><label>Timezone<input value={preferences.timezone} onChange={(event) => updatePreferences({ timezone: event.target.value })} placeholder="America/New_York" /></label><label>Daily digest time<input type="time" value={preferences.dailyDigestTime} onChange={(event) => updatePreferences({ dailyDigestTime: event.target.value })} /></label></div><div className="push-setting"><span><Bell size={16} /><span><strong>Device push notifications</strong><small>{preferences.pushNotifications ? "Enabled for reminders and daily digests on this device." : "Receive reminders when Orbit is closed."}</small></span></span>{preferences.pushNotifications ? <button className="secondary-button" disabled={pushBusy} onClick={() => void turnOffPush()}>{pushBusy ? "Disabling…" : "Turn off"}</button> : <button className="secondary-button" disabled={pushBusy || dataMode !== "firestore"} onClick={() => void turnOnPush()}>{pushBusy ? "Enabling…" : "Enable push"}</button>}</div><div className="settings-fields single-column reminder-toggles"><Toggle checked={preferences.reminderInApp} onChange={(checked) => updatePreferences({ reminderInApp: checked })} label="In-app reminders" description="Create notifications in Orbit." /><Toggle checked={preferences.reminderEmail} onChange={(checked) => updatePreferences({ reminderEmail: checked })} label="Email reminders" description="Send one reminder per task and due date." /><Toggle checked={preferences.assignmentEmails} onChange={(checked) => updatePreferences({ assignmentEmails: checked })} label="Task assignments" description="Email me when a task is assigned to me." /><Toggle checked={preferences.mentionEmails} onChange={(checked) => updatePreferences({ mentionEmails: checked })} label="Mentions and comments" description="Email me when someone mentions me." /><Toggle checked={preferences.overdueEmails} onChange={(checked) => updatePreferences({ overdueEmails: checked })} label="Overdue reminders" description="Send a daily reminder for overdue work." /><Toggle checked={preferences.dailyDigest} onChange={(checked) => updatePreferences({ dailyDigest: checked })} label="Daily digest" description={`Deliver a summary at ${preferences.dailyDigestTime} in ${preferences.timezone}.`} /></div></section>
       <section className="settings-card firebase-card"><header><h2>Firebase project</h2><p>Connection used by this application.</p></header><dl><div><dt>Project</dt><dd>Orbit-PM</dd></div><div><dt>Project ID</dt><dd>orbit-pm-79c3b</dd></div><div><dt>Authentication</dt><dd>{isFirebaseConfigured ? "SDK connected" : "Not configured"}</dd></div><div><dt>Data mode</dt><dd>{dataMode === "firestore" ? "Shared Firestore" : "Browser local storage"}</dd></div></dl><p className="firebase-note"><CircleAlert size={15} /> {dataMode === "firestore" ? "Projects, tasks, preferences, and invitations sync through Firestore. Scheduled reminder delivery requires the worker deployment." : "Demo mode keeps data in this browser. Set NEXT_PUBLIC_DEMO_MODE=false to require sign-in and use Firestore."}</p></section>
       <section className="settings-card"><header><h2>Personal views and templates</h2><p>Manage the shortcuts and reusable project plans you created.</p></header><div className="resource-list">{(data.savedViews ?? []).map((item) => <div key={item.id}><Save size={14} /><span><strong>{item.name}</strong><small>Saved view · {data.projects.find((project) => project.id === item.projectId)?.name}</small></span><button className="icon-button" onClick={() => update({ savedViews: data.savedViews.filter((viewItem) => viewItem.id !== item.id) })}><Trash2 size={13} /></button></div>)}{(data.customTemplates ?? []).map((item) => <div key={item.id}><FolderPlus size={14} /><span><strong>{item.name}</strong><small>Project template · {item.tasks.length} tasks</small></span><button className="icon-button" onClick={() => update({ customTemplates: data.customTemplates.filter((template) => template.id !== item.id) })}><Trash2 size={13} /></button></div>)}{!data.savedViews.length && !data.customTemplates.length && <p className="drawer-empty">Saved views and custom templates will appear here.</p>}</div></section>
     </div></div>
@@ -1090,11 +1289,14 @@ function ProjectModal({ data, close, save, onboarding = false }: { data: Workspa
         assigneeId: draft.assigneeId,
         startDate: draft.startDate,
         dueDate: draft.dueDate,
-        durationDays: Math.max(1, Math.floor(draft.durationDays)),
+        durationDays: Math.max(draft.isMilestone ? 0 : 1, Math.floor(draft.durationDays)),
+        isMilestone: draft.isMilestone,
+        baselineDueDate: draft.baselineDueDate,
         estimate: draft.estimate,
         labels: draft.labels,
         parentTaskId: draft.parentDraftId ? taskIds.get(draft.parentDraftId) : undefined,
         dependencyIds: draft.dependencyDraftIds?.map((dependencyDraftId) => taskIds.get(dependencyDraftId)).filter((id): id is string => Boolean(id)) ?? [],
+        dependencyLags: Object.fromEntries((draft.dependencyDraftIds ?? []).flatMap((dependencyDraftId, dependencyPosition) => taskIds.get(dependencyDraftId) ? [[taskIds.get(dependencyDraftId)!, draft.dependencyLags?.[dependencyPosition] ?? 0]] : [])),
         subtasks: draft.subtasks ?? [], comments: 0, attachments: 0, commentItems: [], attachmentItems: [], activity: [], createdAt: timestamp, updatedAt: timestamp,
       }));
     save(project, tasks);

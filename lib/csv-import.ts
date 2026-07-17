@@ -14,6 +14,9 @@ export interface ImportedTask {
   sourceId?: string;
   parentIndex?: number;
   dependencyIndexes?: number[];
+  dependencyLags?: number[];
+  isMilestone?: boolean;
+  baselineDueDate?: string;
 }
 
 export interface CsvImportResult {
@@ -36,6 +39,8 @@ const headerAliases: Record<string, string> = {
   predecessor: "predecessors", predecessor_ids: "predecessors", dependency: "predecessors", dependencies: "predecessors", depends_on: "predecessors",
   duration: "duration_days", days: "duration_days", duration_in_days: "duration_days",
   project_note: "project_notes",
+  baseline: "baseline_due_date", baseline_finish: "baseline_due_date", baseline_due: "baseline_due_date",
+  type: "task_type",
 };
 
 function normalizeHeader(value: string) {
@@ -102,6 +107,11 @@ function splitReferences(value: string) {
   return value.split(/[;,|]/).map((reference) => reference.trim()).filter(Boolean);
 }
 
+function predecessorReference(value: string) {
+  const match = value.trim().match(/^(.*?)(?:FS)?\s*([+-]\s*\d+)\s*d?$/i);
+  return { reference: (match?.[1] ?? value).trim(), lag: match ? Number(match[2].replaceAll(" ", "")) : 0 };
+}
+
 function parentCreatesCycle(tasks: ImportedTask[], taskIndex: number, parentIndex: number) {
   const visited = new Set<number>([taskIndex]);
   let current: number | undefined = parentIndex;
@@ -156,11 +166,12 @@ export function parseTaskCsv(text: string, members: Member[], defaultStartDate: 
     );
     const assignee = record.assignee ? matchedAssignee ?? members[0] : undefined;
     const startDate = validDate(record.start_date ?? "", defaultStartDate);
+    const isMilestone = record.task_type?.trim().toLowerCase() === "milestone";
     const parsedDuration = Number(record.duration_days);
-    const explicitDuration = Number.isFinite(parsedDuration) && parsedDuration >= 1 ? Math.floor(parsedDuration) : undefined;
+    const explicitDuration = Number.isFinite(parsedDuration) && parsedDuration >= (isMilestone ? 0 : 1) ? Math.floor(parsedDuration) : undefined;
     const importedDueDate = validDate(record.due_date ?? "", "");
     const dueDate = importedDueDate || addDays(startDate, explicitDuration ? explicitDuration - 1 : 7);
-    const durationDays = explicitDuration ?? inclusiveDuration(startDate, dueDate);
+    const durationDays = isMilestone ? 0 : explicitDuration ?? inclusiveDuration(startDate, dueDate);
     const estimate = Number(record.estimate);
     const taskType = record.task_type?.trim();
     const labels = (record.labels ?? "").split(/[;,|]/).map((label) => label.trim()).filter(Boolean);
@@ -184,6 +195,8 @@ export function parseTaskCsv(text: string, members: Member[], defaultStartDate: 
       estimate: Number.isFinite(estimate) && estimate >= 0 ? estimate : 0,
       labels,
       sourceId: record.wbs || undefined,
+      isMilestone,
+      baselineDueDate: validDate(record.baseline_due_date ?? "", "") || undefined,
     }];
   });
 
@@ -218,21 +231,25 @@ export function parseTaskCsv(text: string, members: Member[], defaultStartDate: 
 
   tasks.forEach((task, index) => {
     const dependencyIndexes: number[] = [];
-    for (const predecessor of references[index].predecessors) {
-      const dependencyIndex = resolveReference(predecessor);
+    const dependencyLags: number[] = [];
+    for (const rawPredecessor of references[index].predecessors) {
+      const predecessor = predecessorReference(rawPredecessor);
+      const dependencyIndex = resolveReference(predecessor.reference);
       if (dependencyIndex === undefined) {
-        warnings.push(`Row ${references[index].row}: predecessor “${predecessor}” was not found.`);
+        warnings.push(`Row ${references[index].row}: predecessor “${predecessor.reference}” was not found.`);
         continue;
       }
       if (dependencyIndex === index || dependencyIndexes.includes(dependencyIndex)) continue;
       task.dependencyIndexes = dependencyIndexes;
       if (dependencyCreatesCycle(tasks, index, dependencyIndex)) {
-        warnings.push(`Row ${references[index].row}: predecessor “${predecessor}” was ignored because it creates a cycle.`);
+        warnings.push(`Row ${references[index].row}: predecessor “${predecessor.reference}” was ignored because it creates a cycle.`);
         continue;
       }
       dependencyIndexes.push(dependencyIndex);
+      dependencyLags.push(predecessor.lag);
     }
     task.dependencyIndexes = dependencyIndexes;
+    task.dependencyLags = dependencyLags;
   });
 
   return { tasks, warnings: [...new Set(warnings)].slice(0, 6), skipped, projectNotes };
