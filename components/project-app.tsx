@@ -535,6 +535,66 @@ export function ProjectApp() {
     setToast("Project archived");
   }
 
+  function importCsvIntoProject(file?: File) {
+    if (!file || !activeProject) return;
+    const projectId = activeProject.id;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = parseTaskCsv(String(reader.result ?? ""), data.members, activeProject.startDate || today());
+      if (!result.tasks.length) {
+        setToast(result.warnings[0] ?? "No tasks could be imported");
+        return;
+      }
+
+      const timestamp = new Date().toISOString();
+      const taskIds = result.tasks.map(() => uid("task"));
+      const additions: Task[] = result.tasks.map((task, index) => ({
+        id: taskIds[index],
+        projectId,
+        title: task.title.trim(),
+        description: task.description,
+        status: task.status,
+        priority: task.priority,
+        assigneeId: task.assigneeId,
+        startDate: task.startDate,
+        dueDate: task.dueDate,
+        durationDays: task.durationDays,
+        estimate: task.estimate,
+        labels: task.labels,
+        parentTaskId: task.parentIndex === undefined ? undefined : taskIds[task.parentIndex],
+        dependencyIds: task.dependencyIndexes?.map((dependencyIndex) => taskIds[dependencyIndex]).filter(Boolean) ?? [],
+        subtasks: [],
+        comments: 0,
+        attachments: 0,
+        commentItems: [],
+        attachmentItems: [],
+        activity: [{ id: uid("activity"), actorId: currentUserId, kind: "created", summary: `imported ${task.title}`, createdAt: timestamp }],
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      }));
+      const importedStart = additions.map((task) => task.startDate).sort()[0];
+      const importedDue = additions.map((task) => task.dueDate).sort().at(-1)!;
+
+      setData((current) => {
+        const project = current.projects.find((item) => item.id === projectId);
+        if (!project) return current;
+        const updatedProject = {
+          ...project,
+          startDate: [project.startDate, importedStart].filter(Boolean).sort()[0],
+          dueDate: [project.dueDate, importedDue].filter(Boolean).sort().at(-1)!,
+        };
+        return {
+          ...current,
+          projects: current.projects.map((item) => item.id === projectId ? updatedProject : item),
+          tasks: recalculateProjectSchedule([...current.tasks, ...additions], updatedProject),
+        };
+      });
+      setToast(`${additions.length} task${additions.length === 1 ? "" : "s"} imported${result.warnings.length ? ` · ${result.warnings[0]}` : ""}`);
+    };
+    reader.onerror = () => setToast("The CSV file could not be read");
+    reader.readAsText(file);
+  }
+
   function exportCsv() {
     const outlined = taskOutline(visibleTasks);
     const rowNumbers = new Map(outlined.map((row) => [row.task.id, row.outline]));
@@ -686,8 +746,8 @@ export function ProjectApp() {
           {section === "project" && view === "overview" && <Overview data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} addMilestone={(name, dueDate, description) => setData((current) => ({ ...current, milestones: [...(current.milestones ?? []), { id: uid("milestone"), projectId: activeProject.id, name, dueDate, description, complete: false }] }))} toggleMilestone={(id) => setData((current) => ({ ...current, milestones: current.milestones.map((item) => item.id === id ? { ...item, complete: !item.complete } : item) }))} removeMilestone={(id) => setData((current) => ({ ...current, milestones: current.milestones.filter((item) => item.id !== id), tasks: current.tasks.map((task) => task.milestoneId === id ? { ...task, milestoneId: undefined } : task) }))} />}
           {section === "project" && view === "list" && <ListView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
           {section === "project" && view === "board" && <BoardView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
-          {section === "project" && view === "timeline" && <TimelineView data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} />}
-          {section === "project" && view === "table" && <ScheduleTable data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} onAddTask={addScheduleTask} exportCsv={exportCsv} />}
+          {section === "project" && view === "timeline" && <TimelineView data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} importCsv={importCsvIntoProject} />}
+          {section === "project" && view === "table" && <ScheduleTable data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} onAddTask={addScheduleTask} importCsv={importCsvIntoProject} exportCsv={exportCsv} />}
           {section === "project" && view === "calendar" && <ProjectCalendar data={data} tasks={visibleTasks} onTask={setSelectedTaskId} />}
           {section === "people" && <PeopleManagementView data={data} invitations={invitations} invite={() => setInviteModalOpen(true)} resend={(invitation) => void resendInvitation(invitation)} revoke={(invitation) => void revokeInvitation(invitation)} updateRole={(memberId, role) => setData((current) => ({ ...current, members: current.members.map((member) => member.id === memberId ? { ...member, role } : member) }))} />}
           {section === "inbox" && <InboxView data={data} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} markOne={(id) => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => notification.id === id ? { ...notification, read: true } : notification) }))} openSettings={() => openSection("settings")} />}
@@ -849,12 +909,21 @@ function BoardView({ data, tasks, onTask, onStatus }: { data: WorkspaceData; tas
   return <div className="board-view">{columns.map((status) => { const group = tasks.filter((task) => task.status === status || (status === "In Progress" && task.status === "Blocked")); return <section className="board-column" key={status} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { const id = event.dataTransfer.getData("task-id"); if (id) onStatus(id, { status }); }}><header><span className={`status-symbol ${statusTone[status]}`}><StatusIcon status={status} /></span><strong>{status}</strong><em>{group.length}</em><button><Plus size={15} /></button><button><MoreHorizontal size={16} /></button></header><div className="board-cards">{group.map((task) => <article key={task.id} className="task-card" draggable onDragStart={(event) => event.dataTransfer.setData("task-id", task.id)} onClick={() => onTask(task.id)}><div className="card-labels">{task.labels.slice(0, 2).map((label) => <span key={label}>{label}</span>)}<button><MoreHorizontal size={15} /></button></div><h3>{task.title}</h3><p>{task.description}</p><div className="card-meta"><span className={`priority-dot ${priorityTone[task.priority]}`} /><span className={isOverdue(task) ? "overdue" : ""}><CalendarDays size={13} />{dateLabel(task.dueDate)}</span><div /><Avatar member={data.members.find((member) => member.id === task.assigneeId)} small /></div>{(task.comments > 0 || task.attachments > 0) && <div className="card-footer">{task.comments > 0 && <span><MessageSquare size={12} />{task.comments}</span>}{task.attachments > 0 && <span><Paperclip size={12} />{task.attachments}</span>}</div>}</article>)}</div><button className="add-column-task"><Plus size={14} /> Add task</button></section>; })}</div>;
 }
 
-function TimelineView({ data, project, tasks, onTask }: { data: WorkspaceData; project: Project; tasks: Task[]; onTask: (id: string) => void }) {
+function TimelineView({ data, project, tasks, onTask, importCsv }: { data: WorkspaceData; project: Project; tasks: Task[]; onTask: (id: string) => void; importCsv: (file?: File) => void }) {
   const projectStart = new Date(`${project.startDate}T12:00:00`).getTime();
   const projectEnd = new Date(`${project.dueDate}T12:00:00`).getTime();
   const span = Math.max(1, projectEnd - projectStart);
   const weeks = Array.from({ length: 6 }, (_, index) => { const date = new Date(projectStart + (span / 5) * index); return new Intl.DateTimeFormat("en", { month: "short", day: "numeric" }).format(date); });
-  return <div className="timeline-view panel"><div className="timeline-header"><div className="timeline-task-col">Task</div><div className="timeline-weeks">{weeks.map((week) => <span key={week}>{week}</span>)}</div></div>{tasks.map((task) => { const left = Math.max(0, ((new Date(`${task.startDate}T12:00:00`).getTime() - projectStart) / span) * 100); const width = Math.max(5, ((new Date(`${task.dueDate}T12:00:00`).getTime() - new Date(`${task.startDate}T12:00:00`).getTime()) / span) * 100); return <button className="timeline-row" key={task.id} onClick={() => onTask(task.id)}><span className="timeline-task-col"><StatusIcon status={task.status} /><span><strong>{task.title}</strong><small>{data.members.find((member) => member.id === task.assigneeId)?.name}</small></span></span><span className="timeline-track"><i className={statusTone[task.status]} style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}><b>{task.estimate}h</b></i></span></button>; })}<div className="timeline-today" style={{ left: `calc(260px + ${Math.max(0, Math.min(100, ((Date.now() - projectStart) / span) * 100))}% * (100% - 260px) / 100)` }}><span>Today</span></div></div>;
+  return <div className="timeline-view panel">
+    <div className="timeline-import-toolbar"><div><strong>Project timeline</strong><span>Import tasks, dates, durations, and predecessors from CSV.</span></div><label className="sheet-import-button"><UploadCloud size={14} /> Import CSV<input type="file" accept=".csv,text/csv" onChange={(event) => { importCsv(event.target.files?.[0]); event.currentTarget.value = ""; }} /></label></div>
+    <div className="timeline-header"><div className="timeline-task-col">Task</div><div className="timeline-weeks">{weeks.map((week) => <span key={week}>{week}</span>)}</div></div>
+    {tasks.map((task) => {
+      const left = Math.max(0, ((new Date(`${task.startDate}T12:00:00`).getTime() - projectStart) / span) * 100);
+      const width = Math.max(5, ((new Date(`${task.dueDate}T12:00:00`).getTime() - new Date(`${task.startDate}T12:00:00`).getTime()) / span) * 100);
+      return <button className="timeline-row" key={task.id} onClick={() => onTask(task.id)}><span className="timeline-task-col"><StatusIcon status={task.status} /><span><strong>{task.title}</strong><small>{data.members.find((member) => member.id === task.assigneeId)?.name}</small></span></span><span className="timeline-track"><i className={statusTone[task.status]} style={{ left: `${left}%`, width: `${Math.min(width, 100 - left)}%` }}><b>{task.estimate}h</b></i></span></button>;
+    })}
+    <div className="timeline-today" style={{ left: `calc(260px + ${Math.max(0, Math.min(100, ((Date.now() - projectStart) / span) * 100))}% * (100% - 260px) / 100)` }}><span>Today</span></div>
+  </div>;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
