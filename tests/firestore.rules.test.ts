@@ -1,7 +1,7 @@
 import { readFileSync } from "node:fs";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { assertFails, assertSucceeds, initializeTestEnvironment, type RulesTestEnvironment } from "@firebase/rules-unit-testing";
-import { doc, getDoc, setDoc } from "firebase/firestore";
+import { deleteDoc, doc, getDoc, setDoc, writeBatch } from "firebase/firestore";
 
 const hasEmulator = Boolean(process.env.FIRESTORE_EMULATOR_HOST);
 const rulesSuite = hasEmulator ? describe : describe.skip;
@@ -46,6 +46,12 @@ rulesSuite("Firestore security rules", () => {
     await assertFails(setDoc(doc(viewerDb, "workspaces", "w1", "tasks", "t2"), { ...task, id: "t2" }));
   });
 
+  it("prevents clients from provisioning or permanently deleting workspaces", async () => {
+    const ownerDb = environment.authenticatedContext("owner").firestore();
+    await assertFails(setDoc(doc(ownerDb, "workspaces", "forged"), { workspaceName: "Forged", ownerId: "owner" }));
+    await assertFails(deleteDoc(doc(ownerDb, "workspaces", "w1")));
+  });
+
   it("prevents members from changing workspace ownership", async () => {
     const memberDb = environment.authenticatedContext("member").firestore();
     await assertFails(setDoc(doc(memberDb, "workspaces", "w1"), { workspaceName: "Taken", ownerId: "member" }));
@@ -57,6 +63,19 @@ rulesSuite("Firestore security rules", () => {
     const wrongDb = environment.authenticatedContext("wrong-user", { email: "wrong@example.com" }).firestore();
     await assertSucceeds(getDoc(doc(inviteeDb, "workspaces", "w1", "invitations", "invite1")));
     await assertFails(getDoc(doc(wrongDb, "workspaces", "w1", "invitations", "invite1")));
+  });
+
+  it("requires a verified invited email before creating membership", async () => {
+    const member = { id: "new-user", email: "new@example.com", name: "New User", initials: "NU", color: "#6857d9", role: "Member", invitationId: "invite1" };
+    async function accept(emailVerified: boolean) {
+      const db = environment.authenticatedContext("new-user", { email: "new@example.com", email_verified: emailVerified }).firestore();
+      const batch = writeBatch(db);
+      batch.set(doc(db, "workspaces", "w1", "members", "new-user"), member);
+      batch.update(doc(db, "workspaces", "w1", "invitations", "invite1"), { status: "accepted", acceptedAt: new Date().toISOString(), acceptedBy: "new-user" });
+      return batch.commit();
+    }
+    await assertFails(accept(false));
+    await assertSucceeds(accept(true));
   });
 
   it("allows editors to manage milestones and templates but blocks viewers", async () => {

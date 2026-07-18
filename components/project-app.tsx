@@ -56,13 +56,14 @@ import { ProjectCalendar } from "@/components/project-calendar";
 import { MobileHome, MobileTaskActions, QuickTaskSheet } from "@/components/mobile-workflows";
 import { ScheduleTable } from "@/components/schedule-table";
 import { TaskDetailDrawer } from "@/components/task-detail-drawer";
+import { DangerZone } from "@/components/danger-zone";
 import { clearFirebaseOfflineCache, disablePushNotifications, enableFirebaseAnalytics, enableFirebaseAppCheck, enablePushNotifications, getFirebaseAuth, getFirebaseFirestore, getFirebaseStorage, isDemoMode, isFirebaseConfigured } from "@/lib/firebase";
 import { parseTaskCsv, type ImportedTask } from "@/lib/csv-import";
 import { csvColumns, projectTemplates, sampleCsv, type ProjectTemplate } from "@/lib/project-templates";
 import { onAuthStateChanged, sendEmailVerification, signOut } from "firebase/auth";
 import { doc, setDoc } from "firebase/firestore";
 import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
-import { ensureUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
+import { resolveUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
 import { findNewerServerTaskConflicts, type OfflineConflict } from "@/lib/offline-conflicts";
 import { createWorkspaceInvitation, resendWorkspaceInvitation, revokeWorkspaceInvitation, subscribeToWorkspaceInvitations } from "@/lib/invitations";
 import { dateLabel, daysUntil, filterTasks, isDueToday, isOverdue, PRIORITIES, taskProgress, TASK_STATUSES } from "@/lib/task-utils";
@@ -290,7 +291,7 @@ export function ProjectApp() {
       }
       window.sessionStorage.setItem(ACTIVE_USER_KEY, user.uid);
       setCurrentUserId(user.uid);
-      void ensureUserWorkspace(db, user).then((workspaceId) => {
+      void resolveUserWorkspace(db, user).then((workspaceId) => {
         if (cancelled) return;
         workspaceIdRef.current = workspaceId;
         setWorkspaceId(workspaceId);
@@ -308,7 +309,7 @@ export function ProjectApp() {
           setCloudError(`Firestore could not load this workspace: ${error.message}`);
         });
       }).catch((error: unknown) => {
-        setCloudError(`Your workspace could not be created: ${error instanceof Error ? error.message : "Unknown error"}`);
+        setCloudError(error instanceof Error ? error.message : "Your workspace could not be opened.");
       });
     });
 
@@ -1173,6 +1174,7 @@ function SettingsView({ data, currentUserId, workspaceId, dataMode, update, noti
       <section className="settings-card"><header><h2>My reminders and email</h2><p>Customize timing, timezone, digest delivery, and channels for your account.</p></header><div className="settings-fields"><label>Remind me before due date<input type="number" min="0" max="365" step="1" value={preferences.reminderDaysBefore} onChange={(event) => updatePreferences({ reminderDaysBefore: Math.max(0, Math.floor(Number(event.target.value))) })} /><small className="field-help">Days before the task is due</small></label><label>Reminder delivery time<input type="time" value={preferences.reminderTime} onChange={(event) => updatePreferences({ reminderTime: event.target.value })} /><small className="field-help">Uses your timezone below</small></label><label>Timezone<input value={preferences.timezone} onChange={(event) => updatePreferences({ timezone: event.target.value })} placeholder="America/New_York" /></label><label>Daily digest time<input type="time" value={preferences.dailyDigestTime} onChange={(event) => updatePreferences({ dailyDigestTime: event.target.value })} /></label></div><div className="push-setting"><span><Bell size={16} /><span><strong>Device push notifications</strong><small>{preferences.pushNotifications ? "Enabled for reminders and daily digests on this device." : "Receive reminders when Orbit is closed."}</small></span></span>{preferences.pushNotifications ? <button className="secondary-button" disabled={pushBusy} onClick={() => void turnOffPush()}>{pushBusy ? "Disabling…" : "Turn off"}</button> : <button className="secondary-button" disabled={pushBusy || dataMode !== "firestore"} onClick={() => void turnOnPush()}>{pushBusy ? "Enabling…" : "Enable push"}</button>}</div><div className="settings-fields single-column reminder-toggles"><Toggle checked={preferences.reminderInApp} onChange={(checked) => updatePreferences({ reminderInApp: checked })} label="In-app reminders" description="Create notifications in Orbit." /><Toggle checked={preferences.reminderEmail} onChange={(checked) => updatePreferences({ reminderEmail: checked })} label="Email reminders" description="Send one reminder per task and due date." /><Toggle checked={preferences.assignmentEmails} onChange={(checked) => updatePreferences({ assignmentEmails: checked })} label="Task assignments" description="Email me when a task is assigned to me." /><Toggle checked={preferences.mentionEmails} onChange={(checked) => updatePreferences({ mentionEmails: checked })} label="Mentions and comments" description="Email me when someone mentions me." /><Toggle checked={preferences.overdueEmails} onChange={(checked) => updatePreferences({ overdueEmails: checked })} label="Overdue reminders" description="Send a daily reminder for overdue work." /><Toggle checked={preferences.dailyDigest} onChange={(checked) => updatePreferences({ dailyDigest: checked })} label="Daily digest" description={`Deliver a summary at ${preferences.dailyDigestTime} in ${preferences.timezone}.`} /></div></section>
       <section className="settings-card firebase-card"><header><h2>Firebase project</h2><p>Connection used by this application.</p></header><dl><div><dt>Project</dt><dd>Orbit-PM</dd></div><div><dt>Project ID</dt><dd>orbit-pm-79c3b</dd></div><div><dt>Authentication</dt><dd>{isFirebaseConfigured ? "SDK connected" : "Not configured"}</dd></div><div><dt>Data mode</dt><dd>{dataMode === "firestore" ? "Shared Firestore" : "Browser local storage"}</dd></div></dl><p className="firebase-note"><CircleAlert size={15} /> {dataMode === "firestore" ? "Projects, tasks, preferences, and invitations sync through Firestore. Scheduled reminder delivery requires the worker deployment." : "Demo mode keeps data in this browser. Set NEXT_PUBLIC_DEMO_MODE=false to require sign-in and use Firestore."}</p></section>
       <section className="settings-card"><header><h2>Personal views and templates</h2><p>Manage the shortcuts and reusable project plans you created.</p></header><div className="resource-list">{(data.savedViews ?? []).map((item) => <div key={item.id}><Save size={14} /><span><strong>{item.name}</strong><small>Saved view · {data.projects.find((project) => project.id === item.projectId)?.name}</small></span><button className="icon-button" onClick={() => update({ savedViews: data.savedViews.filter((viewItem) => viewItem.id !== item.id) })}><Trash2 size={13} /></button></div>)}{(data.customTemplates ?? []).map((item) => <div key={item.id}><FolderPlus size={14} /><span><strong>{item.name}</strong><small>Project template · {item.tasks.length} tasks</small></span><button className="icon-button" onClick={() => update({ customTemplates: data.customTemplates.filter((template) => template.id !== item.id) })}><Trash2 size={13} /></button></div>)}{!data.savedViews.length && !data.customTemplates.length && <p className="drawer-empty">Saved views and custom templates will appear here.</p>}</div></section>
+      <DangerZone workspaceId={workspaceId} workspaceName={data.workspaceName} isOwner={currentMember.role === "Owner"} firestoreConnected={dataMode === "firestore"} />
     </div></div>
   </div>;
 }

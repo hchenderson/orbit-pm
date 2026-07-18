@@ -12,7 +12,6 @@ import {
   type Firestore,
   type Unsubscribe,
 } from "firebase/firestore";
-import { seedData } from "./seed";
 import { withReminderSchedule } from "./reminder-schedule";
 import type { CustomTemplate, Member, Milestone, Notification, Project, SavedView, Task, WorkspaceData } from "./types";
 
@@ -26,77 +25,30 @@ interface WorkspaceDocument {
   updatedAt: string;
 }
 
-function initials(name: string) {
-  return name.split(/\s+/).map((part) => part[0]).join("").slice(0, 2).toUpperCase() || "U";
-}
-
-function initialWorkspace(user: User): WorkspaceData {
-  const name = user.displayName?.trim() || user.email?.split("@")[0] || "Orbit User";
-  const member: Member = {
-    id: user.uid,
-    name,
-    email: user.email ?? "",
-    initials: initials(name),
-    color: "#6857d9",
-    role: "Owner",
-    preferences: {
-      reminderDaysBefore: 1,
-      reminderTime: "09:00",
-      timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
-      dailyDigestTime: "08:00",
-      reminderEmail: true,
-      reminderInApp: true,
-      dailyDigest: true,
-      assignmentEmails: true,
-      mentionEmails: true,
-      overdueEmails: true,
-    },
-  };
-  return {
-    workspaceName: `${name.split(" ")[0]}’s Workspace`,
-    settings: { ...seedData.settings!, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || seedData.settings!.timezone },
-    members: [member],
-    projects: [],
-    tasks: [],
-    notifications: [],
-    milestones: [],
-    savedViews: [],
-    customTemplates: [],
-  };
-}
-
-function workspaceIdFor(user: User) {
-  return `workspace_${user.uid}`;
-}
-
 function withoutUndefined<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-export async function ensureUserWorkspace(db: Firestore, user: User) {
+export class InvitationRequiredError extends Error {
+  constructor() {
+    super("Orbit is invite-only. Open the invitation email for this account, or ask a workspace owner to send a new invitation.");
+    this.name = "InvitationRequiredError";
+  }
+}
+
+export async function resolveUserWorkspace(db: Firestore, user: User) {
   const userRef = doc(db, "users", user.uid);
   const existing = await getDoc(userRef);
   const existingWorkspaceId = existing.data()?.defaultWorkspaceId as string | undefined;
   if (existingWorkspaceId) return existingWorkspaceId;
 
-  const workspaceId = workspaceIdFor(user);
-  const data = initialWorkspace(user);
+  // Preserve access for workspaces created before invite-only enforcement was enabled.
+  const legacyWorkspaceId = `workspace_${user.uid}`;
+  const legacyMembership = await getDoc(doc(db, "workspaces", legacyWorkspaceId, "members", user.uid));
+  if (!legacyMembership.exists()) throw new InvitationRequiredError();
   const timestamp = new Date().toISOString();
-  const identityBatch = writeBatch(db);
-  identityBatch.set(userRef, { displayName: data.members[0].name, email: data.members[0].email, defaultWorkspaceId: workspaceId, createdAt: timestamp, updatedAt: timestamp });
-  identityBatch.set(doc(db, "workspaces", workspaceId), { workspaceName: data.workspaceName, ownerId: user.uid, settings: data.settings, createdAt: timestamp, updatedAt: timestamp } satisfies WorkspaceDocument);
-  identityBatch.set(doc(db, "workspaces", workspaceId, "members", user.uid), data.members[0]);
-  await identityBatch.commit();
-
-  const contentBatch = writeBatch(db);
-  for (const project of data.projects) contentBatch.set(doc(db, "workspaces", workspaceId, "projects", project.id), project);
-  for (const task of data.tasks) contentBatch.set(doc(db, "workspaces", workspaceId, "tasks", task.id), withoutUndefined(task));
-  for (const notification of data.notifications) contentBatch.set(doc(db, "workspaces", workspaceId, "notifications", notification.id), { ...notification, recipientId: user.uid });
-  for (const milestone of data.milestones) contentBatch.set(doc(db, "workspaces", workspaceId, "milestones", milestone.id), milestone);
-  for (const savedView of data.savedViews) contentBatch.set(doc(db, "workspaces", workspaceId, "savedViews", savedView.id), savedView);
-  for (const template of data.customTemplates) contentBatch.set(doc(db, "workspaces", workspaceId, "templates", template.id), template);
-  await contentBatch.commit();
-  return workspaceId;
+  await setDoc(userRef, { displayName: user.displayName ?? user.email?.split("@")[0] ?? "Orbit User", email: user.email ?? "", defaultWorkspaceId: legacyWorkspaceId, createdAt: timestamp, updatedAt: timestamp }, { merge: true });
+  return legacyWorkspaceId;
 }
 
 export function subscribeToWorkspace(db: Firestore, workspaceId: string, userId: string, onData: (data: WorkspaceData) => void, onError: (error: Error) => void): Unsubscribe {

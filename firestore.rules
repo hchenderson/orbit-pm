@@ -36,13 +36,12 @@ service cloud.firestore {
     }
 
     match /workspaces/{workspaceId} {
-      allow create: if signedIn()
-        && request.resource.data.ownerId == request.auth.uid
-        && request.resource.data.workspaceName is string;
+      // Workspace creation and permanent deletion are server-only operations.
+      // This prevents a newly authenticated but uninvited account from provisioning data.
+      allow create, delete: if false;
       allow read: if isMember(workspaceId);
       allow update: if canManage(workspaceId)
         && request.resource.data.ownerId == resource.data.ownerId;
-      allow delete: if roleIs(workspaceId, ['Owner']);
 
       match /members/{memberId} {
         allow read: if isMember(workspaceId);
@@ -56,6 +55,7 @@ service cloud.firestore {
               memberId == request.auth.uid
               && request.resource.data.invitationId is string
               && request.auth.token.email is string
+              && request.auth.token.email_verified == true
               && get(/databases/$(database)/documents/workspaces/$(workspaceId)/invitations/$(request.resource.data.invitationId)).data.status == 'pending'
               && get(/databases/$(database)/documents/workspaces/$(workspaceId)/invitations/$(request.resource.data.invitationId)).data.email == request.auth.token.email
               && request.resource.data.role == get(/databases/$(database)/documents/workspaces/$(workspaceId)/invitations/$(request.resource.data.invitationId)).data.role
@@ -129,6 +129,7 @@ service cloud.firestore {
           || (
             signedIn()
             && request.auth.token.email is string
+            && request.auth.token.email_verified == true
             && resource.data.email == request.auth.token.email
             && resource.data.status == 'pending'
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status', 'acceptedAt', 'acceptedBy'])

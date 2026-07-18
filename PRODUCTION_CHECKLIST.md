@@ -5,7 +5,7 @@
 - [x] Firebase Authentication client integration and signed-out redirect
 - [x] Firestore workspace repository with realtime subscriptions
 - [x] Separate workspace, member, project, task, and notification documents
-- [x] First-sign-in workspace provisioning
+- [x] Invitation acceptance and legacy-workspace resolution without arbitrary workspace provisioning
 - [x] Local demo mode kept behind `NEXT_PUBLIC_DEMO_MODE`
 - [x] Owner/Admin/Member/Viewer Firestore Security Rules
 - [x] Firestore indexes and Emulator Suite configuration
@@ -20,6 +20,10 @@
 - [x] Firebase App Hosting runtime configuration
 - [x] Installable PWA, offline Firestore cache, connectivity state, and mobile deep links
 - [x] Firebase Cloud Messaging device registration and reminder/digest push delivery code
+- [x] Server-enforced invite-only registration policy and client provisioning guard
+- [x] Automated authenticated account and workspace deletion workflow
+- [x] Browser-to-Google Cloud Error Reporting pipeline and recovery boundaries
+- [x] Playwright staging E2E suite and GitHub Actions workflow
 
 ## Carter: Firebase Console tasks
 
@@ -27,6 +31,7 @@
 - [ ] Deploy `firestore.rules` and `firestore.indexes.json` with `npx firebase-tools deploy --only firestore` after logging in.
 - [ ] In **Authentication → Sign-in method**, enable Google and Email/Password.
 - [ ] In **Authentication → Settings → Authorized domains**, add the App Hosting domain, custom domain, and any preview domains you intend to use.
+- [ ] Upgrade Authentication to **Identity Platform**, then deploy and verify the `enforceInviteOnlyRegistration` blocking Function.
 - [ ] In **App Check**, register the web app with reCAPTCHA Enterprise, copy the public **site key** into `NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY`, monitor metrics, then enable enforcement for Firestore. Never expose the secret key.
 - [ ] Upgrade the project to the Blaze plan before using App Hosting, scheduled functions, email extensions, or production backups.
 - [ ] Create a billing budget and billing alerts in Google Cloud Billing.
@@ -38,7 +43,7 @@
 
 - [x] Email architecture selected: Firebase Trigger Email extension with Resend SMTP.
 - [x] Invitation policy selected: invite-only, valid until accepted or revoked.
-- [ ] Decide whether “invite-only” means invite-only membership in an existing workspace (implemented) or that uninvited people must be prevented from creating their own separate workspace. The latter requires an Authentication allowlist/blocking function and a bootstrap owner email.
+- [x] Invite-only means uninvited people cannot create an Authentication account or provision a separate workspace.
 - [ ] Create a Resend account, verify the sending domain, and install/configure the Firebase Trigger Email extension using `EMAIL_AND_INVITATIONS.md`.
 - [ ] Provide the sending domain and sender address for invitation and reminder email.
 - [x] Reminder preferences selected: user-customizable timing, user timezone, customizable digest time, email and in-app delivery.
@@ -52,10 +57,12 @@
 - [x] Secure invitation creation, hashed acceptance tokens, and acceptance flow
 - [ ] Configure transactional email delivery in Firebase/Resend
 - [ ] Deploy the completed reminder/digest worker with `npx firebase-tools deploy --only functions`
-- [ ] Automated account and workspace deletion workflow (the public request/instructions page is complete)
+- [x] Automated account and workspace deletion workflow
 - [ ] Attachment uploads and Storage Rules, only if attachments are enabled
-- [ ] End-to-end tests against a Firebase staging project
-- [ ] Error reporting, uptime alerts, and production support workflow
+- [x] End-to-end test suite and CI workflow for a Firebase staging project
+- [x] Error reporting code and operational runbook
+- [ ] Configure the staging Firebase project and GitHub `staging` environment secrets, then run the first E2E workflow
+- [ ] Create Cloud Monitoring alert policies, uptime checks, and notification channels using `docs/ERROR_MONITORING.md`
 
 ## Local verification
 

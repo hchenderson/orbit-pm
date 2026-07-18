@@ -1,5 +1,6 @@
 import type { Metadata, Viewport } from "next";
 import { PwaShell } from "@/components/pwa-shell";
+import { ErrorMonitor } from "@/components/error-monitor";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -19,7 +20,7 @@ export const viewport: Viewport = {
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
     <html lang="en">
-      <body>{children}<PwaShell /></body>
+      <body>{children}<ErrorMonitor /><PwaShell /></body>
     </html>
   );
 }

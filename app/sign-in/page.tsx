@@ -2,7 +2,7 @@
 
 import { FormEvent, useEffect, useState } from "react";
 import { ArrowRight, Check, Eye, EyeOff, Sparkles } from "lucide-react";
-import { createUserWithEmailAndPassword, GoogleAuthProvider, onAuthStateChanged, sendEmailVerification, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup, updateProfile } from "firebase/auth";
+import { createUserWithEmailAndPassword, GoogleAuthProvider, onAuthStateChanged, sendEmailVerification, sendPasswordResetEmail, signInWithEmailAndPassword, signInWithPopup, signOut, updateProfile } from "firebase/auth";
 import Link from "next/link";
 import { getFirebaseAuth, isFirebaseConfigured } from "@/lib/firebase";
 
@@ -17,9 +17,15 @@ export default function SignInPage() {
   const [switching, setSwitching] = useState(false);
   const [currentAccount, setCurrentAccount] = useState("");
   const [message, setMessage] = useState("");
+  const [invitationSignup, setInvitationSignup] = useState(false);
 
   useEffect(() => {
     const isSwitching = new URLSearchParams(window.location.search).get("switch") === "1";
+    const params = new URLSearchParams(window.location.search);
+    const requested = params.get("next") ?? "";
+    setInvitationSignup(requested.startsWith("/invite?"));
+    if (params.get("deleted") === "account") setMessage("Your Orbit account and personal data were deleted.");
+    if (params.get("deleted") === "workspace") setMessage("The workspace was permanently deleted. Your login remains available for future invitations.");
     setSwitching(isSwitching);
     if (!isSwitching) return;
     const auth = getFirebaseAuth();
@@ -27,12 +33,16 @@ export default function SignInPage() {
     return onAuthStateChanged(auth, (user) => setCurrentAccount(user ? user.email ?? user.displayName ?? "your current account" : ""));
   }, []);
 
-  async function finishSignIn(action: () => Promise<unknown>) {
+  async function finishSignIn(action: () => Promise<unknown>, options: { redirect?: boolean; successMessage?: string } = {}) {
     setLoading(true);
     setError("");
     setMessage("");
     try {
       await action();
+      if (options.redirect === false) {
+        if (options.successMessage) setMessage(options.successMessage);
+        return;
+      }
       const requested = new URLSearchParams(window.location.search).get("next");
       window.location.href = requested?.startsWith("/") && !requested.startsWith("//") ? requested : "/";
     } catch (caught) {
@@ -41,6 +51,7 @@ export default function SignInPage() {
       else if (code === "auth/invalid-credential") setError("That email or password is incorrect.");
       else if (code === "auth/weak-password") setError("Use a password with at least 8 characters.");
       else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") setError("Account switching was cancelled. Your current account is still signed in.");
+      else if ((caught instanceof Error ? caught.message : "").toLowerCase().includes("invite")) setError("Orbit is invite-only. Use the email address and link from a valid workspace invitation.");
       else setError(caught instanceof Error ? caught.message.replace("Firebase: ", "") : "Authentication failed.");
     } finally {
       setLoading(false);
@@ -69,8 +80,14 @@ export default function SignInPage() {
       void finishSignIn(async () => {
         const credential = await createUserWithEmailAndPassword(auth, email.trim(), password);
         await updateProfile(credential.user, { displayName: name.trim() });
-        await sendEmailVerification(credential.user);
-      });
+        const requested = new URLSearchParams(window.location.search).get("next") ?? "/";
+        const continueUrl = new URL("/sign-in", window.location.origin);
+        if (requested.startsWith("/") && !requested.startsWith("//")) continueUrl.searchParams.set("next", requested);
+        await sendEmailVerification(credential.user, { url: continueUrl.toString() });
+        await signOut(auth);
+        setMode("signin");
+        setPassword("");
+      }, { redirect: false, successMessage: "Verification email sent. Verify the address, then return to this invitation and sign in." });
       return;
     }
     void finishSignIn(() => signInWithEmailAndPassword(auth, email.trim(), password));
@@ -134,7 +151,7 @@ export default function SignInPage() {
             {message && <p className="form-success">{message}</p>}
             <button className="primary-button signin-submit" type="submit" disabled={loading}>{loading ? (mode === "signin" ? "Signing in…" : mode === "signup" ? "Creating account…" : "Sending…") : (mode === "signin" ? "Sign in" : mode === "signup" ? "Create account" : "Send reset email")}<ArrowRight size={16} /></button>
           </form>
-          {switching ? <p className="signin-footer"><Link href="/">Cancel and keep current account</Link></p> : <p className="signin-footer">{mode === "signin" ? "New to Orbit?" : mode === "signup" ? "Already have an account?" : "Remember your password?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); setMessage(""); }}>{mode === "signin" ? "Create an account" : "Sign in"}</button></p>}
+          {switching ? <p className="signin-footer"><Link href="/">Cancel and keep current account</Link></p> : invitationSignup || mode !== "signin" ? <p className="signin-footer">{mode === "signin" ? "Using an invitation?" : mode === "signup" ? "Already have an account?" : "Remember your password?"} <button type="button" onClick={() => { setMode((value) => value === "signin" ? "signup" : "signin"); setError(""); setMessage(""); }}>{mode === "signin" ? "Create your invited account" : "Sign in"}</button></p> : <p className="signin-footer">Need access? Ask a workspace owner to send an invitation.</p>}
           <nav className="signin-legal"><Link href="/privacy">Privacy</Link><Link href="/terms">Terms</Link><Link href="/support">Support</Link></nav>
         </div>
       </section>

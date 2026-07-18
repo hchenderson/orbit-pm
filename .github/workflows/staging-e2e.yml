@@ -1,0 +1,39 @@
+name: Staging end-to-end tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 11 * * 1-5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: orbit-staging-e2e
+  cancel-in-progress: false
+
+jobs:
+  playwright:
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 20
+    env:
+      E2E_BASE_URL: ${{ vars.STAGING_BASE_URL }}
+      STAGING_TEST_EMAIL: ${{ secrets.STAGING_TEST_EMAIL }}
+      STAGING_TEST_PASSWORD: ${{ secrets.STAGING_TEST_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e:staging
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: staging-playwright-report
+          path: playwright-report
+          retention-days: 14

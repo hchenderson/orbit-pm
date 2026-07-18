@@ -1,6 +1,7 @@
 import { getApp, getApps, initializeApp } from "firebase/app";
 import { getAuth } from "firebase/auth";
 import { clearIndexedDbPersistence, collection, deleteDoc, doc, getDocs, initializeFirestore, persistentLocalCache, persistentMultipleTabManager, query, setDoc, terminate, where, type Firestore } from "firebase/firestore";
+import { getFunctions } from "firebase/functions";
 import { getStorage } from "firebase/storage";
 
 const firebaseConfig = {
@@ -48,6 +49,12 @@ export function getFirebaseStorage() {
   const app = getFirebaseApp();
   if (!app) return null;
   return getStorage(app);
+}
+
+export function getFirebaseFunctions() {
+  const app = getFirebaseApp();
+  if (!app) return null;
+  return getFunctions(app, "us-central1");
 }
 
 export async function clearFirebaseOfflineCache() {

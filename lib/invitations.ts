@@ -56,6 +56,9 @@ export async function getInvitation(db: Firestore, workspaceId: string, token: s
 
 export async function acceptWorkspaceInvitation(db: Firestore, user: User, workspaceId: string, token: string) {
   if (!user.email) throw new Error("Your authenticated account does not have an email address.");
+  await user.reload();
+  if (!user.emailVerified) throw new Error("Verify this email address before accepting the invitation, then sign in again from the invitation link.");
+  await user.getIdToken(true);
   const invitation = await getInvitation(db, workspaceId, token);
   if (invitation.status !== "pending") throw new Error("This invitation has already been accepted or revoked.");
   if (invitation.email.toLowerCase() !== user.email.toLowerCase()) throw new Error(`Sign in as ${invitation.email} to accept this invitation.`);

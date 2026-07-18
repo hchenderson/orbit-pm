@@ -9,6 +9,9 @@ firebase-debug.log
 *.log
 .DS_Store
 coverage
+playwright-report/
+test-results/
+blob-report/
 google-cloud-sdk/
 google-cloud-cli-*.tar.gz
 gcloud config set accessibility
