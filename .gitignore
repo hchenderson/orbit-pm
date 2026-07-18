@@ -4,6 +4,7 @@ out
 dist
 .env
 .env.local
+functions/.env.*
 .firebase
 firebase-debug.log
 *.log
