@@ -9,6 +9,10 @@ Orbit should begin as an installable responsive web app. A separate iOS or Andro
 ## What is now in place
 
 - A phone-sized bottom navigation for Home, My tasks, Inbox, and New task.
+- A focused mobile Home screen with Today, Overdue, Upcoming, View all, and quick completion controls.
+- A phone quick-create sheet that requires only a task name and project.
+- Above-the-fold task actions for completion, status, assignee, comments, and child tasks.
+- Inbox and notification deep links to their related task, project, comment, or invitation.
 - Mobile-safe spacing, drawers, forms, calendar controls, and horizontal schedule-table scrolling.
 - My Tasks now gathers the signed-in user's assignments across every project.
 - The mobile calendar now pairs the month grid with a readable agenda list.
@@ -19,7 +23,7 @@ Orbit should begin as an installable responsive web app. A separate iOS or Andro
 - One shared parent/child task and scheduling model across desktop and mobile.
 - A collapsible desktop sidebar that remembers the user's preference, while phones retain a slide-over navigation drawer.
 
-The app is now an installable PWA. Device testing and the Firebase Web Push certificate are the remaining release gates.
+The Phase 1 and Phase 2 implementation is complete. Real-device beta testing and the Firebase Web Push certificate remain release gates.
 
 ## Phase 1 — mobile-first core flows
 
@@ -28,10 +32,11 @@ Target: the most common actions should take no more than two taps after opening 
 Current status:
 
 - Completed: persistent bottom navigation, cross-project My Tasks, month agenda, responsive task drawer, and preserved desktop/tablet layouts.
-- Next: a dedicated mobile Home screen with Today, Overdue, and Upcoming sections.
-- Next: a compact task detail sheet with complete, status, assignee, comment, and child-task actions above the fold.
-- Next: replace the full New Task form on phones with a quick-create sheet requiring only title and project.
-- Next: make Inbox items deep-link to the related task, project, comment, or invitation.
+- Completed: dedicated mobile Home with Today, Overdue, Upcoming, View all, and quick completion controls.
+- Completed: compact task detail actions for completion, status, assignee, comments, and child tasks above the fold.
+- Completed: phone quick-create sheet requiring only title and project.
+- Completed: Inbox and notification deep links for tasks, projects, comments, and invitations.
+- Completed: polished mobile list cards, working mobile Settings navigation, and a horizontally scrollable spreadsheet table with a swipe hint.
 
 Acceptance criteria:
 
@@ -46,7 +51,8 @@ Acceptance criteria:
 2. Completed: service worker for the application shell and safe static-asset caching.
 3. Completed: Firestore persistent local cache and offline writes.
 4. Completed: connection banner and automatic Firestore synchronization after reconnecting.
-5. Next: show a conflict notice when a newer server edit wins.
+5. Completed: show a conflict notice when a newer server edit wins.
+6. Completed: clear the previous user's persistent Firebase cache during sign-out or account switching before loading the next session.
 
 Do not cache private Firestore responses in a shared HTTP cache. Offline data must remain scoped to the signed-in user, and local data must be cleared when that user signs out or switches accounts.
 

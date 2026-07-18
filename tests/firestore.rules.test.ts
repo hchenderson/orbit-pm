@@ -78,9 +78,10 @@ rulesSuite("Firestore security rules", () => {
   it("allows editors to notify workspace members and blocks viewers", async () => {
     const memberDb = environment.authenticatedContext("member").firestore();
     const viewerDb = environment.authenticatedContext("viewer").firestore();
-    const notification = { id: "n1", recipientId: "owner", taskId: "t1", title: "Mention", body: "You were mentioned", time: "Just now", read: false, tone: "purple" };
+    const notification = { id: "n1", recipientId: "owner", projectId: "p1", taskId: "t1", commentId: "c1", title: "Mention", body: "You were mentioned", time: "Just now", read: false, tone: "purple" };
     await assertSucceeds(setDoc(doc(memberDb, "workspaces", "w1", "notifications", "n1"), notification));
     await assertFails(setDoc(doc(viewerDb, "workspaces", "w1", "notifications", "n2"), { ...notification, id: "n2" }));
+    await assertFails(setDoc(doc(memberDb, "workspaces", "w1", "notifications", "n3"), { ...notification, id: "n3", unsafeRedirect: "https://example.com" }));
   });
 
   it("lets members register only their own push devices", async () => {

@@ -1,7 +1,7 @@
 "use client";
 
 import { CalendarDays, Check, CheckCircle2, ChevronRight, Circle, CircleAlert, Copy, ExternalLink, Link2, Paperclip, Plus, Repeat2, Trash2, UploadCloud, X } from "lucide-react";
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { taskDuration, wouldCreateDependencyCycle, wouldCreateParentCycle } from "@/lib/scheduling";
 import { PRIORITIES, TASK_STATUSES } from "@/lib/task-utils";
 import type { Member, Priority, Task, TaskAttachment, TaskStatus, WorkspaceData } from "@/lib/types";
@@ -30,6 +30,7 @@ interface TaskDetailDrawerProps {
   data: WorkspaceData;
   task: Task;
   currentUserId: string;
+  focusCommentId?: string | null;
   close: () => void;
   update: (id: string, patch: Partial<Task>) => void;
   remove: (id: string) => void;
@@ -41,7 +42,7 @@ interface TaskDetailDrawerProps {
   openTask: (id: string) => void;
 }
 
-export function TaskDetailDrawer({ data, task, currentUserId, close, update, remove, duplicate, addComment, uploadAttachment, removeAttachment, addChild, openTask }: TaskDetailDrawerProps) {
+export function TaskDetailDrawer({ data, task, currentUserId, focusCommentId, close, update, remove, duplicate, addComment, uploadAttachment, removeAttachment, addChild, openTask }: TaskDetailDrawerProps) {
   const [comment, setComment] = useState("");
   const [newChild, setNewChild] = useState("");
   const [uploading, setUploading] = useState(false);
@@ -54,6 +55,11 @@ export function TaskDetailDrawer({ data, task, currentUserId, close, update, rem
   const children = data.tasks.filter((item) => item.parentTaskId === task.id);
   const parent = data.tasks.find((item) => item.id === task.parentTaskId);
   const isSummary = children.length > 0;
+
+  useEffect(() => {
+    if (!focusCommentId) return;
+    window.requestAnimationFrame(() => document.querySelector(".advanced-drawer .comment-thread")?.scrollIntoView({ behavior: "smooth", block: "center" }));
+  }, [focusCommentId, task.id]);
 
   function submitChild(event: FormEvent) {
     event.preventDefault();

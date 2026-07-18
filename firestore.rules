@@ -103,7 +103,7 @@ service cloud.firestore {
             && exists(/databases/$(database)/documents/workspaces/$(workspaceId)/members/$(request.resource.data.recipientId))
             && request.resource.data.title is string
             && request.resource.data.body is string
-            && request.resource.data.keys().hasOnly(['id', 'recipientId', 'taskId', 'title', 'body', 'time', 'read', 'tone'])
+            && request.resource.data.keys().hasOnly(['id', 'recipientId', 'taskId', 'projectId', 'commentId', 'invitationId', 'title', 'body', 'time', 'read', 'tone'])
           );
         allow update, delete: if isMember(workspaceId)
           && resource.data.recipientId == request.auth.uid

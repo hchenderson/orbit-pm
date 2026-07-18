@@ -180,6 +180,7 @@ async function processDueTask(db: Firestore, taskDocument: QueryDocumentSnapshot
     id: deliveryId,
     recipientId: member.id,
     taskId: task.id,
+    projectId: task.projectId,
     title: "Task due soon",
     body: `${task.title} is due ${dueLabel}`,
     time: "Just now",

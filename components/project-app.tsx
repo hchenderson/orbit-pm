@@ -53,6 +53,7 @@ import {
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import { seedData } from "@/lib/seed";
 import { ProjectCalendar } from "@/components/project-calendar";
+import { MobileHome, MobileTaskActions, QuickTaskSheet } from "@/components/mobile-workflows";
 import { ScheduleTable } from "@/components/schedule-table";
 import { TaskDetailDrawer } from "@/components/task-detail-drawer";
 import { clearFirebaseOfflineCache, disablePushNotifications, enableFirebaseAnalytics, enableFirebaseAppCheck, enablePushNotifications, getFirebaseAuth, getFirebaseFirestore, getFirebaseStorage, isDemoMode, isFirebaseConfigured } from "@/lib/firebase";
@@ -62,13 +63,15 @@ import { onAuthStateChanged, sendEmailVerification, signOut } from "firebase/aut
 import { doc, setDoc } from "firebase/firestore";
 import { deleteObject, getDownloadURL, ref, uploadBytes } from "firebase/storage";
 import { ensureUserWorkspace, subscribeToWorkspace, syncWorkspace } from "@/lib/workspace-repository";
+import { findNewerServerTaskConflicts, type OfflineConflict } from "@/lib/offline-conflicts";
 import { createWorkspaceInvitation, resendWorkspaceInvitation, revokeWorkspaceInvitation, subscribeToWorkspaceInvitations } from "@/lib/invitations";
 import { dateLabel, daysUntil, filterTasks, isDueToday, isOverdue, PRIORITIES, taskProgress, TASK_STATUSES } from "@/lib/task-utils";
 import { duplicateTaskTree, inclusiveDuration, migrateLegacySubtasks, recalculateProjectSchedule, taskDuration, taskOutline, wouldCreateParentCycle } from "@/lib/scheduling";
-import type { CustomTemplate, Member, Priority, Project, Role, SavedView, Task, TaskAttachment, TaskComment, TaskStatus, ViewMode, WorkspaceData, WorkspaceInvitation } from "@/lib/types";
+import type { CustomTemplate, Member, Notification, Priority, Project, Role, SavedView, Task, TaskAttachment, TaskComment, TaskStatus, ViewMode, WorkspaceData, WorkspaceInvitation } from "@/lib/types";
 
 const STORAGE_KEY = "orbit-workspace-v1";
 const SIDEBAR_KEY = "orbit-sidebar-collapsed";
+const ACTIVE_USER_KEY = "orbit-active-user";
 type AppSection = "project" | "people" | "inbox" | "settings";
 
 interface WorkspaceHistoryEntry {
@@ -155,6 +158,7 @@ export function ProjectApp() {
   const [assigneeFilter, setAssigneeFilter] = useState("");
   const [priorityFilter, setPriorityFilter] = useState("");
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [selectedCommentId, setSelectedCommentId] = useState<string | null>(null);
   const [taskModalOpen, setTaskModalOpen] = useState(false);
   const [projectModalOpen, setProjectModalOpen] = useState(false);
   const [inviteModalOpen, setInviteModalOpen] = useState(false);
@@ -170,6 +174,8 @@ export function ProjectApp() {
   const [currentUserId, setCurrentUserId] = useState("m1");
   const [workspaceId, setWorkspaceId] = useState("");
   const [invitations, setInvitations] = useState<WorkspaceInvitation[]>([]);
+  const [isPhone, setIsPhone] = useState(false);
+  const [offlineConflicts, setOfflineConflicts] = useState<OfflineConflict[]>([]);
   const workspaceIdRef = useRef("");
   const lastCloudDataRef = useRef<WorkspaceData | null>(null);
   const queuedCloudDataRef = useRef<WorkspaceData | null>(null);
@@ -180,6 +186,7 @@ export function ProjectApp() {
   const redoHistoryRef = useRef<WorkspaceHistoryEntry[]>([]);
   const [, setHistoryRevision] = useState(0);
   const deepLinkHandledRef = useRef(false);
+  const authTransitionRef = useRef(false);
 
   useEffect(() => {
     dataRef.current = data;
@@ -230,6 +237,11 @@ export function ProjectApp() {
 
   useEffect(() => {
     setSidebarCollapsed(window.localStorage.getItem(SIDEBAR_KEY) === "true");
+    const media = window.matchMedia("(max-width: 560px)");
+    const updatePhone = () => setIsPhone(media.matches);
+    updatePhone();
+    media.addEventListener("change", updatePhone);
+    return () => media.removeEventListener("change", updatePhone);
   }, []);
 
   useEffect(() => {
@@ -266,16 +278,24 @@ export function ProjectApp() {
       workspaceUnsubscribe?.();
       workspaceUnsubscribe = undefined;
       if (!user) {
+        if (authTransitionRef.current) return;
         window.location.replace("/sign-in");
         return;
       }
+      const previousUserId = window.sessionStorage.getItem(ACTIVE_USER_KEY);
+      if (previousUserId && previousUserId !== user.uid) {
+        window.sessionStorage.setItem(ACTIVE_USER_KEY, user.uid);
+        void clearFirebaseOfflineCache().finally(() => window.location.reload());
+        return;
+      }
+      window.sessionStorage.setItem(ACTIVE_USER_KEY, user.uid);
       setCurrentUserId(user.uid);
       void ensureUserWorkspace(db, user).then((workspaceId) => {
         if (cancelled) return;
         workspaceIdRef.current = workspaceId;
         setWorkspaceId(workspaceId);
         workspaceUnsubscribe = subscribeToWorkspace(db, workspaceId, user.uid, (cloudData) => {
-          if (pendingSyncsRef.current > 0) {
+        if (pendingSyncsRef.current > 0) {
             queuedCloudDataRef.current = cloudData;
             return;
           }
@@ -331,8 +351,12 @@ export function ProjectApp() {
         if (pendingSyncsRef.current === 0 && queuedCloudDataRef.current) {
           const cloudData = queuedCloudDataRef.current;
           queuedCloudDataRef.current = null;
+          const normalizedCloudData = { ...cloudData, tasks: migrateLegacySubtasks(cloudData.tasks) };
+          const conflicts = findNewerServerTaskConflicts(dataRef.current, normalizedCloudData);
+          if (conflicts.length) setOfflineConflicts(conflicts);
           lastCloudDataRef.current = cloudData;
-          setData({ ...cloudData, tasks: migrateLegacySubtasks(cloudData.tasks) });
+          dataRef.current = normalizedCloudData;
+          setData(normalizedCloudData);
         }
       });
   }, [currentUserId, data, dataMode, loaded]);
@@ -348,10 +372,19 @@ export function ProjectApp() {
     deepLinkHandledRef.current = true;
     const parameters = new URLSearchParams(window.location.search);
     const taskId = parameters.get("task");
-    if (taskId && data.tasks.some((task) => task.id === taskId)) setSelectedTaskId(taskId);
+    const projectId = parameters.get("project");
+    if (projectId && data.projects.some((project) => project.id === projectId)) { setActiveProjectId(projectId); setSection("project"); setView("overview"); }
+    if (taskId && data.tasks.some((task) => task.id === taskId)) {
+      const task = data.tasks.find((item) => item.id === taskId)!;
+      setActiveProjectId(task.projectId);
+      setSection("project");
+      setSelectedCommentId(parameters.get("comment"));
+      setSelectedTaskId(taskId);
+    }
+    if (parameters.get("invitation")) setSection("people");
     if (parameters.get("view") === "my-tasks") { setSection("project"); setMyTasksOnly(true); setView("list"); }
     if (parameters.get("new-task") === "1") setTaskModalOpen(true);
-  }, [data.tasks, loaded]);
+  }, [data.projects, data.tasks, loaded]);
 
   const activeProject = data.projects.find((project) => project.id === activeProjectId) ?? data.projects[0];
   const projectTasks = data.tasks.filter((task) => task.projectId === activeProject?.id);
@@ -363,6 +396,7 @@ export function ProjectApp() {
   const unreadCount = data.notifications.filter((notification) => !notification.read).length;
   const currentMember = data.members.find((member) => member.id === currentUserId) ?? data.members[0];
   const scheduleHistory = undoHistoryRef.current.map(({ id, label, time }) => ({ id, label, time })).slice(0, 8);
+  const mobileHomeActive = section === "project" && !myTasksOnly && view === "overview";
 
   function openSection(next: AppSection) {
     setSection(next);
@@ -370,6 +404,39 @@ export function ProjectApp() {
     setSidebarOpen(false);
     setNotificationsOpen(false);
     setProfileMenuOpen(false);
+  }
+
+  function markNotificationRead(notificationId: string) {
+    setData((current) => ({ ...current, notifications: current.notifications.map((notification) => notification.id === notificationId ? { ...notification, read: true } : notification) }));
+  }
+
+  function openNotification(notification: Notification) {
+    markNotificationRead(notification.id);
+    setNotificationsOpen(false);
+    setSidebarOpen(false);
+    if (notification.taskId) {
+      const task = data.tasks.find((item) => item.id === notification.taskId);
+      if (task) {
+        setActiveProjectId(task.projectId);
+        setSection("project");
+        setMyTasksOnly(false);
+        setSelectedCommentId(notification.commentId ?? null);
+        setSelectedTaskId(task.id);
+        return;
+      }
+    }
+    if (notification.invitationId) {
+      setSection("people");
+      return;
+    }
+    if (notification.projectId && data.projects.some((project) => project.id === notification.projectId)) {
+      setActiveProjectId(notification.projectId);
+      setSection("project");
+      setMyTasksOnly(false);
+      setView("overview");
+      return;
+    }
+    setSection("inbox");
   }
 
   function toggleDesktopSidebar() {
@@ -382,6 +449,8 @@ export function ProjectApp() {
 
   async function handleSignOut() {
     const auth = getFirebaseAuth();
+    authTransitionRef.current = true;
+    setLoaded(false);
     if (auth?.currentUser) await signOut(auth);
     await clearFirebaseOfflineCache();
     window.location.href = "/sign-in";
@@ -389,6 +458,8 @@ export function ProjectApp() {
 
   async function handleSwitchAccount() {
     const auth = getFirebaseAuth();
+    authTransitionRef.current = true;
+    setLoaded(false);
     if (auth?.currentUser) await signOut(auth);
     await clearFirebaseOfflineCache();
     window.location.href = "/sign-in?switch=1";
@@ -405,6 +476,15 @@ export function ProjectApp() {
     setSection("project");
     setProjectModalOpen(false);
     setToast(`Project created with ${tasks.length} starter task${tasks.length === 1 ? "" : "s"}`);
+  }
+
+  function createTask(task: Task) {
+    const project = dataRef.current.projects.find((item) => item.id === task.projectId);
+    if (!project) return;
+    commitWorkspaceChange("Created task", (current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], project) }));
+    setActiveProjectId(project.id);
+    setTaskModalOpen(false);
+    setToast("Task created");
   }
 
   function updateTask(taskId: string, patch: Partial<Task>) {
@@ -493,7 +573,7 @@ export function ProjectApp() {
     if (db && workspaceIdRef.current) {
       for (const recipientId of mentions.filter((id) => id !== currentUserId)) {
         const notificationId = uid("mention");
-        void setDoc(doc(db, "workspaces", workspaceIdRef.current, "notifications", notificationId), { id: notificationId, recipientId, taskId, title: `${currentMember.name} mentioned you`, body: body.trim().slice(0, 180), time: "Just now", read: false, tone: "purple" });
+        void setDoc(doc(db, "workspaces", workspaceIdRef.current, "notifications", notificationId), { id: notificationId, recipientId, taskId, projectId: task.projectId, commentId: comment.id, title: `${currentMember.name} mentioned you`, body: body.trim().slice(0, 180), time: "Just now", read: false, tone: "purple" });
       }
     }
   }
@@ -838,11 +918,11 @@ export function ProjectApp() {
           <button className="icon-button sidebar-collapse-control" onClick={toggleDesktopSidebar} aria-label="Close sidebar"><PanelLeftClose size={18} /></button>
           <button className="icon-button mobile-close" onClick={() => setSidebarOpen(false)} aria-label="Close navigation"><X size={18} /></button>
         </div>
-        <button className="workspace-switcher">
+        <div className="workspace-switcher">
           <span className="workspace-logo">N</span>
           <span><strong>{data.workspaceName}</strong><small>Team workspace</small></span>
           <ChevronDown size={15} />
-        </button>
+        </div>
         <nav className="main-nav" aria-label="Main navigation">
           <button className={section === "project" && !myTasksOnly && view === "overview" ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(false); setView("overview"); setSidebarOpen(false); }}><LayoutDashboard size={17} /> Home</button>
           <button className={section === "project" && myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(true); setView("list"); setSidebarOpen(false); }}><CheckCircle2 size={17} /> My tasks <span className="nav-count">{data.tasks.filter((task) => task.assigneeId === currentUserId && task.status !== "Complete").length}</span></button>
@@ -870,7 +950,7 @@ export function ProjectApp() {
         </div>
       </aside>
 
-      <main className={`main-content ${sidebarCollapsed ? "sidebar-collapsed-content" : ""}`}>
+      <main className={`main-content ${sidebarCollapsed ? "sidebar-collapsed-content" : ""} ${mobileHomeActive ? "mobile-home-context" : ""}`}>
         <header className="topbar">
           {sidebarCollapsed && <button className="icon-button desktop-sidebar-open" onClick={toggleDesktopSidebar} aria-label="Open sidebar"><PanelLeftOpen size={19} /></button>}
           <button className="icon-button mobile-menu" onClick={() => setSidebarOpen(true)} aria-label="Open navigation"><Menu size={19} /></button>
@@ -885,7 +965,7 @@ export function ProjectApp() {
           <div className="project-title-row">
             <span className="project-icon-large" style={{ background: activeProject.color }}>{activeProject.icon}</span>
             <div className="project-heading">
-              <div><h1>{myTasksOnly ? "My tasks" : activeProject.name}</h1><button className="bare-button"><ChevronDown size={17} /></button></div>
+              <div><h1>{myTasksOnly ? "My tasks" : activeProject.name}</h1></div>
               <p>{myTasksOnly ? "Your assigned work across every project" : activeProject.description}</p>
             </div>
             <div className="project-actions">
@@ -915,31 +995,32 @@ export function ProjectApp() {
         </section>}
 
         <section className={`workspace-content ${section !== "project" ? "section-page" : ""}`}>
-          {section === "project" && view === "overview" && <Overview data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} addMilestone={(name, dueDate, description) => setData((current) => ({ ...current, milestones: [...(current.milestones ?? []), { id: uid("milestone"), projectId: activeProject.id, name, dueDate, description, complete: false }] }))} toggleMilestone={(id) => setData((current) => ({ ...current, milestones: current.milestones.map((item) => item.id === id ? { ...item, complete: !item.complete } : item) }))} removeMilestone={(id) => setData((current) => ({ ...current, milestones: current.milestones.filter((item) => item.id !== id), tasks: current.tasks.map((task) => task.milestoneId === id ? { ...task, milestoneId: undefined } : task) }))} />}
-          {section === "project" && view === "list" && <ListView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
-          {section === "project" && view === "board" && <BoardView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} />}
+          {section === "project" && view === "overview" && <><div className="desktop-project-overview"><Overview data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} viewAll={() => setView("list")} addMilestone={(name, dueDate, description) => setData((current) => ({ ...current, milestones: [...(current.milestones ?? []), { id: uid("milestone"), projectId: activeProject.id, name, dueDate, description, complete: false }] }))} toggleMilestone={(id) => setData((current) => ({ ...current, milestones: current.milestones.map((item) => item.id === id ? { ...item, complete: !item.complete } : item) }))} removeMilestone={(id) => setData((current) => ({ ...current, milestones: current.milestones.filter((item) => item.id !== id), tasks: current.tasks.map((task) => task.milestoneId === id ? { ...task, milestoneId: undefined } : task) }))} /></div><MobileHome data={data} currentUserId={currentUserId} onTask={(id) => { setSelectedCommentId(null); setSelectedTaskId(id); }} onStatus={updateTask} onNewTask={() => setTaskModalOpen(true)} onViewAll={() => { setMyTasksOnly(true); setView("list"); }} /></>}
+          {section === "project" && view === "list" && <ListView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} onNewTask={() => setTaskModalOpen(true)} />}
+          {section === "project" && view === "board" && <BoardView data={data} tasks={visibleTasks} onTask={setSelectedTaskId} onStatus={updateTask} onNewTask={() => setTaskModalOpen(true)} />}
           {section === "project" && view === "timeline" && <TimelineView data={data} project={activeProject} tasks={visibleTasks} onTask={setSelectedTaskId} importCsv={importCsvIntoProject} />}
           {section === "project" && view === "table" && <ScheduleTable data={data} project={activeProject} tasks={projectTasks} onTask={setSelectedTaskId} onTaskUpdate={updateTask} onTaskUpdates={updateTasks} onBulkUpdate={bulkUpdate} onBulkDelete={bulkDelete} onAddTask={addScheduleTask} onAddMilestone={addScheduleMilestone} onProjectUpdate={updateActiveProject} onCaptureBaseline={captureScheduleBaseline} onReorder={reorderScheduleTask} onIndent={indentScheduleTask} onOutdent={outdentScheduleTask} history={scheduleHistory} canUndo={undoHistoryRef.current.length > 0} canRedo={redoHistoryRef.current.length > 0} onUndo={undoWorkspaceChange} onRedo={redoWorkspaceChange} importCsv={importCsvIntoProject} exportCsv={exportCsv} />}
           {section === "project" && view === "calendar" && <ProjectCalendar data={data} tasks={visibleTasks} onTask={setSelectedTaskId} />}
           {section === "people" && <PeopleManagementView data={data} invitations={invitations} invite={() => setInviteModalOpen(true)} resend={(invitation) => void resendInvitation(invitation)} revoke={(invitation) => void revokeInvitation(invitation)} updateRole={(memberId, role) => setData((current) => ({ ...current, members: current.members.map((member) => member.id === memberId ? { ...member, role } : member) }))} />}
-          {section === "inbox" && <InboxView data={data} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} markOne={(id) => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => notification.id === id ? { ...notification, read: true } : notification) }))} openSettings={() => openSection("settings")} />}
+          {section === "inbox" && <InboxView data={data} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openNotification={openNotification} openSettings={() => openSection("settings")} />}
           {section === "settings" && <SettingsView data={data} currentUserId={currentUserId} workspaceId={workspaceId} dataMode={dataMode} update={(patch) => setData((current) => ({ ...current, ...patch }))} notify={setToast} />}
         </section>
       </main>
 
-      {notificationsOpen && <NotificationPanel data={data} close={() => setNotificationsOpen(false)} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openInbox={() => openSection("inbox")} openSettings={() => openSection("settings")} />}
+      {notificationsOpen && <NotificationPanel data={data} close={() => setNotificationsOpen(false)} markAll={() => setData((current) => ({ ...current, notifications: current.notifications.map((notification) => ({ ...notification, read: true })) }))} openNotification={openNotification} openInbox={() => openSection("inbox")} openSettings={() => openSection("settings")} />}
       {profileMenuOpen && <ProfileMenu member={currentMember} firebaseConnected={dataMode === "firestore"} close={() => setProfileMenuOpen(false)} openSettings={() => openSection("settings")} switchAccount={() => void handleSwitchAccount()} signOut={() => void handleSignOut()} />}
-      {selectedTask && <TaskDetailDrawer data={data} task={selectedTask} currentUserId={currentUserId} close={() => setSelectedTaskId(null)} update={updateTask} remove={deleteTask} duplicate={duplicateTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} addChild={addChildTask} openTask={setSelectedTaskId} />}
-      {taskModalOpen && <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={(task) => { setData((current) => ({ ...current, tasks: recalculateProjectSchedule([...current.tasks, task], activeProject) })); setTaskModalOpen(false); setToast("Task created"); }} />}
+      {selectedTask && <><TaskDetailDrawer data={data} task={selectedTask} currentUserId={currentUserId} focusCommentId={selectedCommentId} close={() => { setSelectedTaskId(null); setSelectedCommentId(null); }} update={updateTask} remove={deleteTask} duplicate={duplicateTask} addComment={addComment} uploadAttachment={uploadAttachment} removeAttachment={removeAttachment} addChild={addChildTask} openTask={(id) => { setSelectedCommentId(null); setSelectedTaskId(id); }} /><MobileTaskActions task={selectedTask} members={data.members} isSummary={data.tasks.some((task) => task.parentTaskId === selectedTask.id)} update={updateTask} addComment={addComment} addChild={addChildTask} /></>}
+      {taskModalOpen && (isPhone ? <QuickTaskSheet data={data} defaultProjectId={activeProject.id} currentUserId={currentUserId} close={() => setTaskModalOpen(false)} save={createTask} /> : <TaskModal data={data} projectId={activeProject.id} close={() => setTaskModalOpen(false)} save={createTask} />)}
       {projectModalOpen && <ProjectModal data={data} close={() => setProjectModalOpen(false)} save={saveProject} />}
       {inviteModalOpen && <InviteModal dataMode={dataMode} close={() => setInviteModalOpen(false)} save={inviteTeammate} />}
       <nav className="mobile-bottom-nav" aria-label="Mobile navigation"><button className={section === "project" && !myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(false); setView("overview"); }}><LayoutDashboard size={18} /><span>Home</span></button><button className={myTasksOnly ? "active" : ""} onClick={() => { setSection("project"); setMyTasksOnly(true); setView("list"); }}><CheckCircle2 size={18} /><span>My tasks</span></button><button className={section === "inbox" ? "active" : ""} onClick={() => openSection("inbox")}><Inbox size={18} /><span>Inbox</span></button><button onClick={() => setTaskModalOpen(true)}><Plus size={19} /><span>New</span></button></nav>
+      {offlineConflicts.length > 0 && <aside className="conflict-notice" role="alert"><span className="conflict-icon"><RefreshCw size={17} /></span><div><strong>A newer teammate edit was kept</strong><p>{offlineConflicts.length === 1 ? `${offlineConflicts[0].taskTitle} changed while you were offline.` : `${offlineConflicts.length} tasks changed while you were offline.`}</p></div><button onClick={() => { const first = offlineConflicts[0]; setOfflineConflicts([]); setSelectedCommentId(null); setSelectedTaskId(first.taskId); }}>Review</button><button className="conflict-dismiss" onClick={() => setOfflineConflicts([])} aria-label="Dismiss conflict notice"><X size={16} /></button></aside>}
       {toast && <div className="toast"><Check size={16} />{toast}</div>}
     </div>
   );
 }
 
-function Overview({ data, project, tasks, onTask, addMilestone, toggleMilestone, removeMilestone }: { data: WorkspaceData; project: Project; tasks: Task[]; onTask: (id: string) => void; addMilestone: (name: string, dueDate: string, description: string) => void; toggleMilestone: (id: string) => void; removeMilestone: (id: string) => void }) {
+function Overview({ data, project, tasks, onTask, viewAll, addMilestone, toggleMilestone, removeMilestone }: { data: WorkspaceData; project: Project; tasks: Task[]; onTask: (id: string) => void; viewAll: () => void; addMilestone: (name: string, dueDate: string, description: string) => void; toggleMilestone: (id: string) => void; removeMilestone: (id: string) => void }) {
   const progress = taskProgress(tasks);
   const overdue = tasks.filter((task) => isOverdue(task));
   const dueToday = tasks.filter((task) => isDueToday(task));
@@ -958,7 +1039,7 @@ function Overview({ data, project, tasks, onTask, addMilestone, toggleMilestone,
       </div>
 
       <article className="panel upcoming-panel">
-        <div className="panel-header"><div><h2>Upcoming work</h2><p>The next deadlines across this project</p></div><button>View all <ArrowRight size={14} /></button></div>
+        <div className="panel-header"><div><h2>Upcoming work</h2><p>The next deadlines across this project</p></div><button onClick={viewAll}>View all <ArrowRight size={14} /></button></div>
         <div className="task-list-compact">
           {upcoming.map((task) => {
             const member = data.members.find((item) => item.id === task.assigneeId);
@@ -979,7 +1060,7 @@ function Overview({ data, project, tasks, onTask, addMilestone, toggleMilestone,
       </article>
 
       <article className="panel workload-panel">
-        <div className="panel-header"><div><h2>Team workload</h2><p>Open tasks by owner</p></div><button><MoreHorizontal size={17} /></button></div>
+        <div className="panel-header"><div><h2>Team workload</h2><p>Open tasks by owner</p></div></div>
         <div className="workload-list">
           {data.members.filter((member) => project.memberIds.includes(member.id)).map((member) => {
             const count = tasks.filter((task) => task.assigneeId === member.id && task.status !== "Complete").length;
@@ -1029,13 +1110,13 @@ function PeopleManagementView({ data, invitations, invite, resend, revoke, updat
 // Kept temporarily as a compatibility fallback for older embedded previews.
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 function PeopleView({ data, invite, updateRole }: { data: WorkspaceData; invite: () => void; updateRole: (memberId: string, role: Role) => void }) {
-  return <div className="management-page"><SectionHeader eyebrow="Workspace" title="People" description="Manage access, roles, and project participation." action={<button className="primary-button" onClick={invite}><UserPlus size={16} /> Invite teammate</button>} /><div className="people-summary"><article><span className="management-icon purple"><Users size={18} /></span><div><strong>{data.members.length}</strong><small>Active members</small></div></article><article><span className="management-icon green"><ShieldCheck size={18} /></span><div><strong>{data.members.filter((member) => member.role === "Owner" || member.role === "Admin").length}</strong><small>Workspace admins</small></div></article><article><span className="management-icon amber"><Mail size={18} /></span><div><strong>0</strong><small>Pending invitations</small></div></article></div><section className="management-panel"><header><div><h2>Workspace members</h2><p>Everyone who can access {data.workspaceName}</p></div><label className="mini-search"><Search size={14} /><input placeholder="Find a person…" /></label></header><div className="people-table"><div className="people-table-head"><span>Person</span><span>Projects</span><span>Role</span><span>Status</span><span /></div>{data.members.map((member) => { const projects = data.projects.filter((project) => project.memberIds.includes(member.id) && !project.archived); return <div className="people-row" key={member.id}><span className="person-cell"><Avatar member={member} /><span><strong>{member.name}</strong><small>{member.email}</small></span></span><span className="project-access"><span className="avatar-stack small-stack">{projects.slice(0, 3).map((project) => <i key={project.id} style={{ background: project.color }}>{project.icon}</i>)}</span><small>{projects.length} project{projects.length === 1 ? "" : "s"}</small></span><span><select value={member.role} disabled={member.role === "Owner"} onChange={(event) => updateRole(member.id, event.target.value as Role)}><option>Owner</option><option>Admin</option><option>Member</option><option>Viewer</option></select></span><span className="active-status"><i /> Active</span><button className="icon-button" aria-label={`More options for ${member.name}`}><MoreHorizontal size={16} /></button></div>; })}</div></section><aside className="access-note"><ShieldCheck size={18} /><div><strong>Role changes are saved in this local workspace.</strong><p>When the shared backend is connected, the server will enforce these roles on every project and task request.</p></div></aside></div>;
+  return <div className="management-page"><SectionHeader eyebrow="Workspace" title="People" description="Manage access, roles, and project participation." action={<button className="primary-button" onClick={invite}><UserPlus size={16} /> Invite teammate</button>} /><div className="people-summary"><article><span className="management-icon purple"><Users size={18} /></span><div><strong>{data.members.length}</strong><small>Active members</small></div></article><article><span className="management-icon green"><ShieldCheck size={18} /></span><div><strong>{data.members.filter((member) => member.role === "Owner" || member.role === "Admin").length}</strong><small>Workspace admins</small></div></article><article><span className="management-icon amber"><Mail size={18} /></span><div><strong>0</strong><small>Pending invitations</small></div></article></div><section className="management-panel"><header><div><h2>Workspace members</h2><p>Everyone who can access {data.workspaceName}</p></div><label className="mini-search"><Search size={14} /><input placeholder="Find a person…" /></label></header><div className="people-table"><div className="people-table-head"><span>Person</span><span>Projects</span><span>Role</span><span>Status</span><span /></div>{data.members.map((member) => { const projects = data.projects.filter((project) => project.memberIds.includes(member.id) && !project.archived); return <div className="people-row" key={member.id}><span className="person-cell"><Avatar member={member} /><span><strong>{member.name}</strong><small>{member.email}</small></span></span><span className="project-access"><span className="avatar-stack small-stack">{projects.slice(0, 3).map((project) => <i key={project.id} style={{ background: project.color }}>{project.icon}</i>)}</span><small>{projects.length} project{projects.length === 1 ? "" : "s"}</small></span><span><select value={member.role} disabled={member.role === "Owner"} onChange={(event) => updateRole(member.id, event.target.value as Role)}><option>Owner</option><option>Admin</option><option>Member</option><option>Viewer</option></select></span><span className="active-status"><i /> Active</span><button className="icon-button" onClick={() => void navigator.clipboard?.writeText(member.email)} aria-label={`Copy email address for ${member.name}`}><Copy size={16} /></button></div>; })}</div></section><aside className="access-note"><ShieldCheck size={18} /><div><strong>Role changes are saved in this local workspace.</strong><p>When the shared backend is connected, the server will enforce these roles on every project and task request.</p></div></aside></div>;
 }
 
-function InboxView({ data, markAll, markOne, openSettings }: { data: WorkspaceData; markAll: () => void; markOne: (id: string) => void; openSettings: () => void }) {
+function InboxView({ data, markAll, openNotification, openSettings }: { data: WorkspaceData; markAll: () => void; openNotification: (notification: Notification) => void; openSettings: () => void }) {
   const [filter, setFilter] = useState<"all" | "unread">("all");
   const items = filter === "unread" ? data.notifications.filter((notification) => !notification.read) : data.notifications;
-  return <div className="management-page"><SectionHeader eyebrow="Updates" title="Inbox" description="Mentions, assignments, reminders, and important changes." action={<button className="secondary-button" onClick={markAll}><Check size={15} /> Mark all read</button>} /><div className="inbox-layout"><section className="management-panel inbox-main"><header><div className="segmented-control"><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>All <span>{data.notifications.length}</span></button><button className={filter === "unread" ? "active" : ""} onClick={() => setFilter("unread")}>Unread <span>{data.notifications.filter((item) => !item.read).length}</span></button></div></header><div className="inbox-list">{items.length ? items.map((notification) => <button key={notification.id} className={!notification.read ? "unread" : ""} onClick={() => markOne(notification.id)}><span className={`notification-icon ${notification.tone}`}><Bell size={16} /></span><span><strong>{notification.title}</strong><p>{notification.body}</p><small>{notification.time}</small></span>{!notification.read && <i />}</button>) : <div className="empty-inbox"><CheckCircle2 size={27} /><strong>You’re all caught up</strong><p>New assignments and reminders will appear here.</p></div>}</div></section><aside className="inbox-side"><div className="inbox-tip"><Bell size={18} /><h3>Stay in the loop</h3><p>Choose which updates arrive by email and when reminders should be sent.</p><button onClick={openSettings}>Notification settings <ArrowRight size={14} /></button></div><div className="inbox-stat"><span>This week</span><strong>{data.notifications.length}</strong><small>workspace updates</small></div></aside></div></div>;
+  return <div className="management-page"><SectionHeader eyebrow="Updates" title="Inbox" description="Mentions, assignments, reminders, and important changes." action={<button className="secondary-button" onClick={markAll}><Check size={15} /> Mark all read</button>} /><div className="inbox-layout"><section className="management-panel inbox-main"><header><div className="segmented-control"><button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>All <span>{data.notifications.length}</span></button><button className={filter === "unread" ? "active" : ""} onClick={() => setFilter("unread")}>Unread <span>{data.notifications.filter((item) => !item.read).length}</span></button></div></header><div className="inbox-list">{items.length ? items.map((notification) => <button key={notification.id} className={!notification.read ? "unread" : ""} onClick={() => openNotification(notification)}><span className={`notification-icon ${notification.tone}`}><Bell size={16} /></span><span><strong>{notification.title}</strong><p>{notification.body}</p><small>{notification.time}</small></span><ChevronRight className="inbox-target" size={17} />{!notification.read && <i />}</button>) : <div className="empty-inbox"><CheckCircle2 size={27} /><strong>You’re all caught up</strong><p>New assignments and reminders will appear here.</p></div>}</div></section><aside className="inbox-side"><div className="inbox-tip"><Bell size={18} /><h3>Stay in the loop</h3><p>Choose which updates arrive by email and when reminders should be sent.</p><button onClick={openSettings}>Notification settings <ArrowRight size={14} /></button></div><div className="inbox-stat"><span>This week</span><strong>{data.notifications.length}</strong><small>workspace updates</small></div></aside></div></div>;
 }
 
 function Toggle({ checked, onChange, label, description }: { checked: boolean; onChange: (checked: boolean) => void; label: string; description: string }) {
@@ -1050,7 +1131,12 @@ function SettingsView({ data, currentUserId, workspaceId, dataMode, update, noti
   const [workspaceName, setWorkspaceName] = useState(data.workspaceName);
   const [verificationSent, setVerificationSent] = useState(false);
   const [pushBusy, setPushBusy] = useState(false);
+  const [settingsTab, setSettingsTab] = useState<"general" | "notifications" | "permissions" | "integrations">("general");
   const authUser = getFirebaseAuth()?.currentUser;
+  function openSettingsCard(tab: typeof settingsTab, cardIndex: number) {
+    setSettingsTab(tab);
+    document.querySelectorAll<HTMLElement>(".settings-content > .settings-card")[cardIndex]?.scrollIntoView({ behavior: "smooth", block: "start" });
+  }
   function updateSettings(patch: Partial<typeof settings>) { update({ settings: { ...settings, ...patch } }); }
   function updatePreferences(patch: Partial<typeof preferences>) { update({ members: data.members.map((member) => member.id === currentMember.id ? { ...member, preferences: { ...preferences, ...patch } } : member) }); }
   async function turnOnPush() {
@@ -1081,7 +1167,7 @@ function SettingsView({ data, currentUserId, workspaceId, dataMode, update, noti
   }
   return <div className="management-page">
     <SectionHeader eyebrow="Workspace" title="Settings" description="Manage workspace details, defaults, and notifications." action={<span className={`connection-badge ${dataMode === "firestore" ? "connected" : ""}`}><i />{dataMode === "firestore" ? "Firestore connected" : "Local demo mode"}</span>} />
-    <div className="settings-layout"><nav className="settings-nav"><button className="active"><Settings size={15} /> General</button><button><Bell size={15} /> Notifications</button><button><ShieldCheck size={15} /> Permissions</button><button><Link2 size={15} /> Integrations</button></nav><div className="settings-content">
+    <div className="settings-layout"><nav className="settings-nav"><button className={settingsTab === "general" ? "active" : ""} onClick={() => openSettingsCard("general", 0)}><Settings size={15} /> General</button><button className={settingsTab === "notifications" ? "active" : ""} onClick={() => openSettingsCard("notifications", 2)}><Bell size={15} /> Notifications</button><button className={settingsTab === "permissions" ? "active" : ""} onClick={() => openSettingsCard("permissions", 1)}><ShieldCheck size={15} /> Account</button><button className={settingsTab === "integrations" ? "active" : ""} onClick={() => openSettingsCard("integrations", 3)}><Link2 size={15} /> Integrations</button></nav><div className="settings-content">
       <section className="settings-card"><header><h2>Workspace details</h2><p>The name and identity your team sees throughout Orbit.</p></header><div className="settings-fields"><label>Workspace name<input value={workspaceName} onChange={(event) => setWorkspaceName(event.target.value)} /></label><label>Workspace URL<div className="url-input"><span>orbit.app/</span><input value="northstar-studio" readOnly /></div></label><label>Week starts on<select value={settings.weekStartsOn} onChange={(event) => updateSettings({ weekStartsOn: event.target.value as "Sunday" | "Monday" })}><option>Monday</option><option>Sunday</option></select></label><label>Default project view<select value={settings.defaultView} onChange={(event) => updateSettings({ defaultView: event.target.value as ViewMode })}>{viewOptions.map((option) => <option key={option.id} value={option.id}>{option.label}</option>)}</select></label></div><footer><button className="primary-button" onClick={() => { if (workspaceName.trim()) update({ workspaceName: workspaceName.trim() }); notify("Workspace settings saved"); }}>Save changes</button></footer></section>
       <section className="settings-card"><header><h2>Account security</h2><p>Password recovery and email ownership are handled securely by Firebase Authentication.</p></header><dl className="account-security"><div><dt>Email</dt><dd>{authUser?.email ?? currentMember.email}</dd></div><div><dt>Verification</dt><dd>{authUser?.emailVerified ? "Verified" : verificationSent ? "Verification email sent" : "Not verified"}</dd></div></dl>{authUser && !authUser.emailVerified && <footer><button className="secondary-button" disabled={verificationSent} onClick={() => void sendEmailVerification(authUser).then(() => { setVerificationSent(true); notify("Verification email sent"); }).catch((error: unknown) => notify(error instanceof Error ? error.message : "Verification could not be sent"))}>Send verification email</button></footer>}</section>
       <section className="settings-card"><header><h2>My reminders and email</h2><p>Customize timing, timezone, digest delivery, and channels for your account.</p></header><div className="settings-fields"><label>Remind me before due date<input type="number" min="0" max="365" step="1" value={preferences.reminderDaysBefore} onChange={(event) => updatePreferences({ reminderDaysBefore: Math.max(0, Math.floor(Number(event.target.value))) })} /><small className="field-help">Days before the task is due</small></label><label>Reminder delivery time<input type="time" value={preferences.reminderTime} onChange={(event) => updatePreferences({ reminderTime: event.target.value })} /><small className="field-help">Uses your timezone below</small></label><label>Timezone<input value={preferences.timezone} onChange={(event) => updatePreferences({ timezone: event.target.value })} placeholder="America/New_York" /></label><label>Daily digest time<input type="time" value={preferences.dailyDigestTime} onChange={(event) => updatePreferences({ dailyDigestTime: event.target.value })} /></label></div><div className="push-setting"><span><Bell size={16} /><span><strong>Device push notifications</strong><small>{preferences.pushNotifications ? "Enabled for reminders and daily digests on this device." : "Receive reminders when Orbit is closed."}</small></span></span>{preferences.pushNotifications ? <button className="secondary-button" disabled={pushBusy} onClick={() => void turnOffPush()}>{pushBusy ? "Disabling…" : "Turn off"}</button> : <button className="secondary-button" disabled={pushBusy || dataMode !== "firestore"} onClick={() => void turnOnPush()}>{pushBusy ? "Enabling…" : "Enable push"}</button>}</div><div className="settings-fields single-column reminder-toggles"><Toggle checked={preferences.reminderInApp} onChange={(checked) => updatePreferences({ reminderInApp: checked })} label="In-app reminders" description="Create notifications in Orbit." /><Toggle checked={preferences.reminderEmail} onChange={(checked) => updatePreferences({ reminderEmail: checked })} label="Email reminders" description="Send one reminder per task and due date." /><Toggle checked={preferences.assignmentEmails} onChange={(checked) => updatePreferences({ assignmentEmails: checked })} label="Task assignments" description="Email me when a task is assigned to me." /><Toggle checked={preferences.mentionEmails} onChange={(checked) => updatePreferences({ mentionEmails: checked })} label="Mentions and comments" description="Email me when someone mentions me." /><Toggle checked={preferences.overdueEmails} onChange={(checked) => updatePreferences({ overdueEmails: checked })} label="Overdue reminders" description="Send a daily reminder for overdue work." /><Toggle checked={preferences.dailyDigest} onChange={(checked) => updatePreferences({ dailyDigest: checked })} label="Daily digest" description={`Deliver a summary at ${preferences.dailyDigestTime} in ${preferences.timezone}.`} /></div></section>
@@ -1092,20 +1178,20 @@ function SettingsView({ data, currentUserId, workspaceId, dataMode, update, noti
 }
 
 function ProfileMenu({ member, firebaseConnected, close, openSettings, switchAccount, signOut }: { member: Member; firebaseConnected: boolean; close: () => void; openSettings: () => void; switchAccount: () => void; signOut: () => void }) {
-  return <><button className="popover-scrim" onClick={close} aria-label="Close account menu" /><aside className="profile-menu"><header><Avatar member={member} /><span><strong>{member.name}</strong><small>{member.email}</small></span></header><div className="profile-status"><i className={firebaseConnected ? "connected" : ""} />{firebaseConnected ? "Firebase connected" : "Local demo session"}</div><nav><button onClick={close}><UserRound size={16} /> My profile</button><button onClick={openSettings}><Settings size={16} /> Workspace settings</button><button onClick={switchAccount}><RefreshCw size={16} /> Switch account</button><button onClick={signOut}><LogOut size={16} /> Sign out</button></nav></aside></>;
+  return <><button className="popover-scrim" onClick={close} aria-label="Close account menu" /><aside className="profile-menu"><header><Avatar member={member} /><span><strong>{member.name}</strong><small>{member.email}</small></span></header><div className="profile-status"><i className={firebaseConnected ? "connected" : ""} />{firebaseConnected ? "Firebase connected" : "Local demo session"}</div><nav><button onClick={openSettings}><UserRound size={16} /> My profile & preferences</button><button onClick={openSettings}><Settings size={16} /> Workspace settings</button><button onClick={switchAccount}><RefreshCw size={16} /> Switch account</button><button onClick={signOut}><LogOut size={16} /> Sign out</button></nav></aside></>;
 }
 
-function ListView({ data, tasks, onTask, onStatus }: { data: WorkspaceData; tasks: Task[]; onTask: (id: string) => void; onStatus: (id: string, patch: Partial<Task>) => void }) {
-  return <div className="list-view">{TASK_STATUSES.map((status) => { const group = tasks.filter((task) => task.status === status); return <section className="list-group" key={status}><header><span className={`status-symbol ${statusTone[status]}`}><StatusIcon status={status} /></span><strong>{status}</strong><em>{group.length}</em><div /><button><Plus size={15} /></button><button><MoreHorizontal size={16} /></button></header>{group.length ? group.map((task) => <TaskRow key={task.id} task={task} member={data.members.find((member) => member.id === task.assigneeId)} onClick={() => onTask(task.id)} onStatus={(next) => onStatus(task.id, { status: next })} />) : <div className="empty-group">No tasks here</div>}</section>; })}</div>;
+function ListView({ data, tasks, onTask, onStatus, onNewTask }: { data: WorkspaceData; tasks: Task[]; onTask: (id: string) => void; onStatus: (id: string, patch: Partial<Task>) => void; onNewTask: () => void }) {
+  return <div className="list-view">{TASK_STATUSES.map((status) => { const group = tasks.filter((task) => task.status === status); return <section className={`list-group ${group.length ? "" : "empty-list-group"}`} key={status}><header><span className={`status-symbol ${statusTone[status]}`}><StatusIcon status={status} /></span><strong>{status}</strong><em>{group.length}</em><div /><button onClick={onNewTask} aria-label={`Add ${status} task`}><Plus size={15} /></button></header>{group.length ? group.map((task) => <TaskRow key={task.id} task={task} member={data.members.find((member) => member.id === task.assigneeId)} onClick={() => onTask(task.id)} onStatus={(next) => onStatus(task.id, { status: next })} />) : <div className="empty-group">No tasks here</div>}</section>; })}</div>;
 }
 
 function TaskRow({ task, member, onClick, onStatus }: { task: Task; member?: Member; onClick: () => void; onStatus: (status: TaskStatus) => void }) {
-  return <div className="task-row"><button className={`task-check ${statusTone[task.status]}`} onClick={() => onStatus(task.status === "Complete" ? "Not Started" : "Complete")} aria-label="Toggle task"><StatusIcon status={task.status} /></button><button className="task-row-main" onClick={onClick}><strong>{task.title}</strong><span>{task.labels.map((label) => <em key={label}>{label}</em>)}</span></button><span className={`priority-chip ${priorityTone[task.priority]}`}><Flag size={12} />{task.priority}</span><span className={`row-date ${isOverdue(task) ? "overdue" : ""}`}><CalendarDays size={13} />{dateLabel(task.dueDate)}</span><Avatar member={member} small /><button className="row-more"><MoreHorizontal size={16} /></button></div>;
+  return <div className="task-row"><button className={`task-check ${statusTone[task.status]}`} onClick={() => onStatus(task.status === "Complete" ? "Not Started" : "Complete")} aria-label="Toggle task"><StatusIcon status={task.status} /></button><button className="task-row-main" onClick={onClick}><strong>{task.title}</strong><span>{task.labels.map((label) => <em key={label}>{label}</em>)}</span></button><span className={`priority-chip ${priorityTone[task.priority]}`}><Flag size={12} />{task.priority}</span><span className={`row-date ${isOverdue(task) ? "overdue" : ""}`}><CalendarDays size={13} />{dateLabel(task.dueDate)}</span><Avatar member={member} small /><button className="row-more" onClick={onClick} aria-label={`Open ${task.title}`}><MoreHorizontal size={16} /></button></div>;
 }
 
-function BoardView({ data, tasks, onTask, onStatus }: { data: WorkspaceData; tasks: Task[]; onTask: (id: string) => void; onStatus: (id: string, patch: Partial<Task>) => void }) {
+function BoardView({ data, tasks, onTask, onStatus, onNewTask }: { data: WorkspaceData; tasks: Task[]; onTask: (id: string) => void; onStatus: (id: string, patch: Partial<Task>) => void; onNewTask: () => void }) {
   const columns: TaskStatus[] = ["Not Started", "In Progress", "In Review", "Complete"];
-  return <div className="board-view">{columns.map((status) => { const group = tasks.filter((task) => task.status === status || (status === "In Progress" && task.status === "Blocked")); return <section className="board-column" key={status} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { const id = event.dataTransfer.getData("task-id"); if (id) onStatus(id, { status }); }}><header><span className={`status-symbol ${statusTone[status]}`}><StatusIcon status={status} /></span><strong>{status}</strong><em>{group.length}</em><button><Plus size={15} /></button><button><MoreHorizontal size={16} /></button></header><div className="board-cards">{group.map((task) => <article key={task.id} className="task-card" draggable onDragStart={(event) => event.dataTransfer.setData("task-id", task.id)} onClick={() => onTask(task.id)}><div className="card-labels">{task.labels.slice(0, 2).map((label) => <span key={label}>{label}</span>)}<button><MoreHorizontal size={15} /></button></div><h3>{task.title}</h3><p>{task.description}</p><div className="card-meta"><span className={`priority-dot ${priorityTone[task.priority]}`} /><span className={isOverdue(task) ? "overdue" : ""}><CalendarDays size={13} />{dateLabel(task.dueDate)}</span><div /><Avatar member={data.members.find((member) => member.id === task.assigneeId)} small /></div>{(task.comments > 0 || task.attachments > 0) && <div className="card-footer">{task.comments > 0 && <span><MessageSquare size={12} />{task.comments}</span>}{task.attachments > 0 && <span><Paperclip size={12} />{task.attachments}</span>}</div>}</article>)}</div><button className="add-column-task"><Plus size={14} /> Add task</button></section>; })}</div>;
+  return <div className="board-view">{columns.map((status) => { const group = tasks.filter((task) => task.status === status || (status === "In Progress" && task.status === "Blocked")); return <section className="board-column" key={status} onDragOver={(event) => event.preventDefault()} onDrop={(event) => { const id = event.dataTransfer.getData("task-id"); if (id) onStatus(id, { status }); }}><header><span className={`status-symbol ${statusTone[status]}`}><StatusIcon status={status} /></span><strong>{status}</strong><em>{group.length}</em><button onClick={onNewTask} aria-label={`Add task to ${status}`}><Plus size={15} /></button></header><div className="board-cards">{group.map((task) => <article key={task.id} className="task-card" draggable onDragStart={(event) => event.dataTransfer.setData("task-id", task.id)} onClick={() => onTask(task.id)}><div className="card-labels">{task.labels.slice(0, 2).map((label) => <span key={label}>{label}</span>)}</div><h3>{task.title}</h3><p>{task.description}</p><div className="card-meta"><span className={`priority-dot ${priorityTone[task.priority]}`} /><span className={isOverdue(task) ? "overdue" : ""}><CalendarDays size={13} />{dateLabel(task.dueDate)}</span><div /><Avatar member={data.members.find((member) => member.id === task.assigneeId)} small /></div>{(task.comments > 0 || task.attachments > 0) && <div className="card-footer">{task.comments > 0 && <span><MessageSquare size={12} />{task.comments}</span>}{task.attachments > 0 && <span><Paperclip size={12} />{task.attachments}</span>}</div>}</article>)}</div><button className="add-column-task" onClick={onNewTask}><Plus size={14} /> Add task</button></section>; })}</div>;
 }
 
 function TimelineView({ data, project, tasks, onTask, importCsv }: { data: WorkspaceData; project: Project; tasks: Task[]; onTask: (id: string) => void; importCsv: (file?: File) => void }) {
@@ -1149,8 +1235,8 @@ function CalendarView({ data, tasks, onTask }: { data: WorkspaceData; tasks: Tas
   return <div className="calendar-panel panel"><header><div><button><ChevronDown size={15} /></button><h2>{new Intl.DateTimeFormat("en", { month: "long", year: "numeric" }).format(now)}</h2></div><button className="secondary-button">Today</button></header><div className="calendar-grid">{["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].map((day) => <strong className="calendar-weekday" key={day}>{day}</strong>)}{cells.map((day, index) => { const inMonth = day > 0 && day <= daysInMonth; const date = inMonth ? `${year}-${String(month + 1).padStart(2, "0")}-${String(day).padStart(2, "0")}` : ""; const dayTasks = tasks.filter((task) => task.dueDate === date); return <div className={`calendar-day ${!inMonth ? "muted" : ""} ${day === now.getDate() ? "today" : ""}`} key={index}>{inMonth && <span>{day}</span>}{dayTasks.slice(0, 3).map((task) => <button key={task.id} className={statusTone[task.status]} onClick={() => onTask(task.id)}><i style={{ background: data.members.find((member) => member.id === task.assigneeId)?.color }} />{task.title}</button>)}{dayTasks.length > 3 && <small>+{dayTasks.length - 3} more</small>}</div>; })}</div></div>;
 }
 
-function NotificationPanel({ data, close, markAll, openInbox, openSettings }: { data: WorkspaceData; close: () => void; markAll: () => void; openInbox: () => void; openSettings: () => void }) {
-  return <div className="notification-panel panel"><header><div><h2>Notifications</h2><span>{data.notifications.filter((item) => !item.read).length} new</span></div><button className="icon-button" onClick={close}><X size={17} /></button></header><button className="mark-read" onClick={markAll}><Check size={14} /> Mark all as read</button><div className="notification-list">{data.notifications.map((notification) => <button key={notification.id} className={!notification.read ? "unread" : ""}><span className={`notification-icon ${notification.tone}`}><Bell size={15} /></span><span><strong>{notification.title}</strong><p>{notification.body}</p><small>{notification.time}</small></span>{!notification.read && <i />}</button>)}</div><footer><button onClick={openInbox}>Open inbox <ArrowRight size={14} /></button><button onClick={openSettings}>Settings</button></footer></div>;
+function NotificationPanel({ data, close, markAll, openNotification, openInbox, openSettings }: { data: WorkspaceData; close: () => void; markAll: () => void; openNotification: (notification: Notification) => void; openInbox: () => void; openSettings: () => void }) {
+  return <div className="notification-panel panel"><header><div><h2>Notifications</h2><span>{data.notifications.filter((item) => !item.read).length} new</span></div><button className="icon-button" onClick={close}><X size={17} /></button></header><button className="mark-read" onClick={markAll}><Check size={14} /> Mark all as read</button><div className="notification-list">{data.notifications.map((notification) => <button key={notification.id} className={!notification.read ? "unread" : ""} onClick={() => openNotification(notification)}><span className={`notification-icon ${notification.tone}`}><Bell size={15} /></span><span><strong>{notification.title}</strong><p>{notification.body}</p><small>{notification.time}</small></span>{!notification.read && <i />}</button>)}</div><footer><button onClick={openInbox}>Open inbox <ArrowRight size={14} /></button><button onClick={openSettings}>Settings</button></footer></div>;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars

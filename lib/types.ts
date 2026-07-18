@@ -210,6 +210,9 @@ export interface Notification {
   tone: "purple" | "amber" | "red" | "green";
   recipientId?: string;
   taskId?: string;
+  projectId?: string;
+  commentId?: string;
+  invitationId?: string;
 }
 
 export interface WorkspaceData {

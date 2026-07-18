@@ -50,9 +50,9 @@ export const seedData: WorkspaceData = {
     { id: "t10", projectId: "p3", title: "Draft campaign brief", description: "Align audience, promise, channels, and success measures.", status: "In Progress", priority: "High", assigneeId: "m1", startDate: dateFromToday(1), dueDate: dateFromToday(10), estimate: 4, labels: ["Campaign"], subtasks: [], comments: 2, attachments: 1, createdAt: now, updatedAt: now },
   ],
   notifications: [
-    { id: "n1", title: "Task due today", body: "Finalize homepage copy is due today", time: "12 min ago", read: false, tone: "amber" },
-    { id: "n2", title: "Maya mentioned you", body: "Can you review the final homepage direction?", time: "1 hr ago", read: false, tone: "purple" },
-    { id: "n3", title: "Task blocked", body: "Optimize launch imagery needs attention", time: "Yesterday", read: true, tone: "red" },
+    { id: "n1", taskId: "t1", projectId: "p1", title: "Task due today", body: "Finalize homepage copy is due today", time: "12 min ago", read: false, tone: "amber" },
+    { id: "n2", taskId: "t1", projectId: "p1", commentId: "c1", title: "Maya mentioned you", body: "Can you review the final homepage direction?", time: "1 hr ago", read: false, tone: "purple" },
+    { id: "n3", taskId: "t4", projectId: "p1", title: "Task blocked", body: "Optimize launch imagery needs attention", time: "Yesterday", read: true, tone: "red" },
   ],
   milestones: [
     { id: "milestone-launch", projectId: "p1", name: "Website launch", dueDate: dateFromToday(18), description: "Public launch readiness", complete: false },
