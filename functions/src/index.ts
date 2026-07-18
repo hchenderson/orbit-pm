@@ -14,7 +14,7 @@ import { hasRecentLogin, safeErrorText } from "./security";
 
 initializeApp();
 
-const bootstrapOwnerEmails = defineString("INVITE_ONLY_BOOTSTRAP_EMAILS", { default: "" });
+const bootstrapOwnerEmails = defineString("INVITE_ONLY_BOOTSTRAP_EMAILS", { default: "disabled" });
 
 interface Preferences {
   reminderDaysBefore?: number;
