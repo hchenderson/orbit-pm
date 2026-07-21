@@ -47,9 +47,11 @@ export default function SignInPage() {
       window.location.href = requested?.startsWith("/") && !requested.startsWith("//") ? requested : "/";
     } catch (caught) {
       const code = typeof caught === "object" && caught && "code" in caught ? String(caught.code) : "";
-      if (code === "auth/email-already-in-use") setError("An account already exists for this email. Choose Sign in instead.");
+      if (code === "auth/email-already-in-use") setError("Your invited account already exists. Choose Sign in; the invitation page can resend the verification email.");
       else if (code === "auth/invalid-credential") setError("That email or password is incorrect.");
       else if (code === "auth/weak-password") setError("Use a password with at least 8 characters.");
+      else if (code === "auth/too-many-requests") setError("Firebase temporarily limited sign-in attempts. Wait a few minutes, then try again or reset your password.");
+      else if (code === "auth/user-disabled") setError("This account has been disabled. Contact the workspace owner.");
       else if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") setError("Account switching was cancelled. Your current account is still signed in.");
       else if ((caught instanceof Error ? caught.message : "").toLowerCase().includes("invite")) setError("Orbit is invite-only. Use the email address and link from a valid workspace invitation.");
       else setError(caught instanceof Error ? caught.message.replace("Firebase: ", "") : "Authentication failed.");
@@ -83,7 +85,12 @@ export default function SignInPage() {
         const requested = new URLSearchParams(window.location.search).get("next") ?? "/";
         const continueUrl = new URL("/sign-in", window.location.origin);
         if (requested.startsWith("/") && !requested.startsWith("//")) continueUrl.searchParams.set("next", requested);
-        await sendEmailVerification(credential.user, { url: continueUrl.toString() });
+        try {
+          await sendEmailVerification(credential.user, { url: continueUrl.toString() });
+        } catch {
+          await signOut(auth);
+          throw new Error("Your account was created, but the verification email could not be sent. Sign in from the invitation and choose Resend verification email.");
+        }
         await signOut(auth);
         setMode("signin");
         setPassword("");
